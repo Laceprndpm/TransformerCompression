@@ -3,7 +3,8 @@
 
 from .adapters.llama_adapter import LlamaModelAdapter
 from .adapters.opt_adapter import OPTModelAdapter
-from .adapters.phi2_adapter import Phi2ModelAdapter
+from .adapters.phi2_disp_adapter import Phi2DispModelAdapter
+# from .adapters.phi2_adapter import Phi2ModelAdapter
 from .adapters.phi3_adapter import Phi3ModelAdapter
 from .data_utils import get_dataset, prepare_dataloader
 from .gpu_utils import benchmark, distribute_model, evaluate_ppl

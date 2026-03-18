@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 import pathlib
+import ipdb
 import shutil
 import datetime
 import sys
@@ -32,6 +33,7 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parent / "src"))
 from src.disp.utils.distributed_env import DistributedEnv
 from src.disp.pruning.hypernetwork import hypernetwork
 from src.disp.pruning.pruning_helper import collect_info_reg_llama, help_functions_hn
+
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -125,7 +127,9 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument('--hn-batch-size', type=int, default=1, help="Batch size for hypernetwork training.")
     parser.add_argument('--hn-use-fsdp', action="store_true", help="Use FSDP for model during hn training.")
     parser.add_argument('--hn-num-workers', type=int, default=2, help="Dataloader workers (kept for DISP parity).")
-    parser.add_argument('--hn-seed', type=int, default=None, help="Random seed for hn training (default uses start_iter).")
+    parser.add_argument(
+        '--hn-seed', type=int, default=None, help="Random seed for hn training (default uses start_iter)."
+    )
     parser.add_argument('--hn-block-size', type=int, default=2048, help="Sequence length for hn training.")
     parser.add_argument('--hn-p', type=float, default=0.48, help="Target parameter ratio p for hn regularizer.")
     parser.add_argument('--hn-lam', type=float, default=16.0, help="Regularization strength for hn.")
@@ -389,8 +393,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
         logging.info(f'Loaded model perplexity: {dataset_ppl}')
         wandb.log({"original_ppl": dataset_ppl})
-        return
-
+    ipdb.set_trace()
     # # original ppl
     # if args.eval_baseline:
     #     reset_model_device()
@@ -433,7 +436,7 @@ def slicing_main(args: argparse.Namespace) -> None:
     # scheduler = ConstSlicingScheduler(new_embedding_dimension)
     # rotate.rotate_and_slice(model_adapter, train_loader, scheduler, final_orientation=args.final_orientation)
     # logging.info("Model structure:\n%s", model)
-    
+
     # if args.save_dir:
     #     sliced_model_dir = pathlib.Path(args.save_dir)
     #     sliced_model_dir.mkdir(parents=True, exist_ok=True)

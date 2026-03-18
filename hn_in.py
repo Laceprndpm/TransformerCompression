@@ -6,13 +6,32 @@ import logging
 import os
 import pathlib
 import shutil
-import ipdb
+import datetime
+import sys
 import torch
 import wandb
+import torch.distributed as dist
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from functools import partial
 
 from slicegpt import data_utils, gpu_utils, hf_utils, layernorm_fusion, rotate, utils
 from slicegpt.config import config
 from slicegpt.slicing_scheduler import ConstSlicingScheduler
+
+# CHANGED: ensure local src/ is importable when running from repo root.
+sys.path.append(str(pathlib.Path(__file__).resolve().parent / "src"))
+
+from src.disp.utils.distributed_env import DistributedEnv
+from src.disp.pruning.hypernetwork import hypernetwork
+from src.disp.pruning.pruning_helper import collect_info_reg_llama, help_functions_hn
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -99,6 +118,22 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         default=None,
         help="PyTorch device to use. Example values are 'cpu', 'cuda', 'cuda:0'. If not specified it will be defaulted to 'cuda' if available and 'cpu' otherwise.",
     )
+    # DISP-style hypernetwork training (copied from DISP train_hypernetwork.py with minimal changes)
+    parser.add_argument('--train-hn', action="store_true", help="Train a DISP hypernetwork after loading model.")
+    parser.add_argument('--hn-steps', type=int, default=100000, help="Total training steps for hypernetwork.")
+    parser.add_argument('--hn-start-iter', type=int, default=0, help="Start iteration for hypernetwork training.")
+    parser.add_argument('--hn-batch-size', type=int, default=1, help="Batch size for hypernetwork training.")
+    parser.add_argument('--hn-use-fsdp', action="store_true", help="Use FSDP for model during hn training.")
+    parser.add_argument('--hn-num-workers', type=int, default=2, help="Dataloader workers (kept for DISP parity).")
+    parser.add_argument('--hn-seed', type=int, default=None, help="Random seed for hn training (default uses start_iter).")
+    parser.add_argument('--hn-block-size', type=int, default=2048, help="Sequence length for hn training.")
+    parser.add_argument('--hn-p', type=float, default=0.48, help="Target parameter ratio p for hn regularizer.")
+    parser.add_argument('--hn-lam', type=float, default=16.0, help="Regularization strength for hn.")
+    parser.add_argument('--hn-lr', type=float, default=1e-3, help="Hypernetwork learning rate.")
+    parser.add_argument('--hn-min-lr', type=float, default=1e-3, help="Min LR for hn scheduler.")
+    parser.add_argument('--hn-use-sch', action="store_true", help="Use cosine scheduler for hn.")
+    parser.add_argument('--hn-use-bf16', action="store_true", help="Use bf16 for hn training.")
+    parser.add_argument('--hn-out-dir', type=str, default=None, help="Output dir to save hn checkpoint.")
 
     return parser.parse_args() if interactive else parser.parse_args('')
 
@@ -146,7 +181,6 @@ def slicing_main(args: argparse.Namespace) -> None:
         model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(
             args.model, args.model_path, token=args.hf_token, dtype=config.dtype
         )
-    ipdb.set_trace()
     model = model_adapter.model
 
     def reset_model_device() -> None:
@@ -170,6 +204,184 @@ def slicing_main(args: argparse.Namespace) -> None:
     test_loader = data_utils.prepare_test_dataloader(
         dataset=test_dataset, tokenizer=tokenizer, batch_size=args.ppl_eval_batch_size
     )
+
+    def train_hn() -> None:
+        # NOTE: This function mirrors DISP-LLM/train_hypernetwork.py flow.
+        # CHANGED: Uses SliceGPT dataloader for simplicity and local consistency.
+        # NOTE: DistributedEnv expects torchrun/torch.distributed env vars to be set.
+        env = DistributedEnv()
+        env.print_master(env)
+
+        dist.init_process_group(
+            backend="nccl",
+            rank=env.global_rank,
+            world_size=env.world_size,
+            timeout=datetime.timedelta(seconds=3600 * 5),
+        )
+
+        data_type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if args.hn_use_bf16:
+            data_type = torch.bfloat16
+
+        hn_out_dir = args.hn_out_dir
+        if hn_out_dir is None:
+            user_name = "user"
+            date_time_obj = datetime.datetime.now()
+            hn_out_dir = os.path.join("/output/", user_name, date_time_obj.strftime("%Y%m%d-%H%M%S"))
+
+        if args.hn_seed is None:
+            args.hn_seed = args.hn_start_iter
+
+        if env.global_rank == 0:
+            os.makedirs(hn_out_dir, exist_ok=True)
+
+        device_id = env.local_rank
+        torch.cuda.set_device(device_id)
+        torch.cuda.empty_cache()
+
+        # NOTE: keep model in train mode like DISP.
+        model.config.use_cache = False
+        model.to(device_id)
+
+        # CHANGED: use SliceGPT dataloader (tokenizes and creates labels).
+        train_loader = data_utils.prepare_dataloader(
+            dataset=train_dataset,
+            tokenizer=tokenizer,
+            max_seqlen=args.hn_block_size,
+            batch_size=args.hn_batch_size,
+            nsamples=args.cal_nsamples,
+            varied_seqlen=args.varied_seqlen,
+            seed=args.seed,
+        )
+
+        # collect pruning info and build hypernetwork
+        param_reg = collect_info_reg_llama(model, p=args.hn_p, lam=args.hn_lam)
+        hn = hypernetwork(t_structures=param_reg.structures)
+        hn_helper = help_functions_hn(param_reg.structures)
+
+        hn.to(device_id)
+        hn = DDP(hn)
+
+        # Wrap model with FSDP if requested (DISP parity).
+        if args.hn_use_fsdp:
+            # CHANGED: use current layer class for wrapping instead of PruneLlamaDecoderLayer.
+            wrap_cls = {type(model.model.layers[0])}
+            my_auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls=wrap_cls)
+            if args.hn_use_bf16:
+                model.to(data_type)
+                model_fsdp = FSDP(model, auto_wrap_policy=my_auto_wrap_policy, use_orig_params=True)
+            else:
+                model_fsdp = FSDP(
+                    model,
+                    auto_wrap_policy=my_auto_wrap_policy,
+                    use_orig_params=True,
+                    mixed_precision=MixedPrecision(
+                        param_dtype=data_type,
+                        reduce_dtype=data_type,
+                        buffer_dtype=data_type,
+                    ),
+                )
+            model_to_train = model_fsdp
+        else:
+            if args.hn_use_bf16:
+                model.to(data_type)
+            model_to_train = DDP(model)
+
+        # Freeze model params; only train hn.
+        for param in model_to_train.parameters():
+            param.requires_grad = False
+        for param in hn.parameters():
+            param.requires_grad = True
+        hn.train()
+
+        optimizer = torch.optim.AdamW(hn.parameters(), lr=args.hn_lr, weight_decay=0.05)
+        if args.hn_use_sch:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.hn_steps,
+                eta_min=args.hn_min_lr,
+                last_epoch=args.hn_start_iter - 1,
+            )
+        else:
+            scheduler = None
+
+        # CHANGED: use GradScaler for AMP to match DISP on single process.
+        scaler = GradScaler()
+        iter_num = args.hn_start_iter
+
+        while True:
+            for batch in train_loader:
+                if iter_num >= args.hn_steps:
+                    break
+
+                with torch.no_grad():
+                    input_ids = batch["input_ids"].to(device_id)
+                    targets = batch["labels"].to(device_id)
+                    input_ids = input_ids[:, : args.hn_block_size]
+                    targets = targets[:, : args.hn_block_size]
+
+                with autocast(device_type="cuda", dtype=data_type):
+                    vectors = hn()
+                    hn_helper.set_gate_vectors(model_to_train, vectors)
+                    output = model_to_train(input_ids)
+                    logits = output.logits if hasattr(output, "logits") else output
+                    ce_loss = torch.nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        targets.view(-1),
+                        # CHANGED: SliceGPT dataloader pads; ignore pad tokens if available.
+                        ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100,
+                    )
+
+                    if hasattr(hn, "module"):
+                        hard_out = hn.module.hard_output()
+                    else:
+                        hard_out = hn.hard_output()
+
+                    reg_loss = param_reg(hard_out)
+                    total_loss = ce_loss + reg_loss
+
+                if torch.isnan(total_loss):
+                    env.print_master("!!! nan loss detected !!!")
+                    total_loss.fill_(0)
+
+                env.print_master(f"ce loss: {ce_loss:.4f} reg_loss: {reg_loss:.4f}")
+
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                if iter_num % 50 == 0:
+                    env.print_master(
+                        f"Iter {iter_num}/{args.hn_steps}, "
+                        f"loss={total_loss.item():.4f}, "
+                        f"reg={reg_loss.item():.4f}"
+                    )
+
+                iter_num += 1
+                if iter_num >= args.hn_steps:
+                    break
+            if iter_num >= args.hn_steps:
+                break
+
+        # Save the hypernetwork checkpoint (match DISP behavior).
+        if env.world_size == 1:
+            if env.global_rank == 0:
+                torch.save(hn.state_dict(), os.path.join(hn_out_dir, f"hn-ckpt-final-{args.hn_p:.2f}.pt"))
+        else:
+            if hasattr(hn, "module"):
+                state_dict_hn = hn.module.state_dict()
+            else:
+                state_dict_hn = hn.state_dict()
+            if env.global_rank == 0:
+                torch.save(state_dict_hn, os.path.join(hn_out_dir, f"hn-ckpt-final-{args.hn_p:.2f}.pt"))
+
+    if args.train_hn:
+        train_hn()
 
     # evaluate perplexity and exit if sliced model is loaded or if ppl_only is set
     if args.sliced_model_path or args.ppl_only:

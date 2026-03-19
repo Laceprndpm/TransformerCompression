@@ -69,7 +69,7 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         "--final-orientation",
         type=str,
         default="random",
-        choices=["random", "pca"],
+        choices=["random", "pca", "pca_random_index"],
         help="Final orientation of the sliced weights.",
     )
     parser.add_argument(

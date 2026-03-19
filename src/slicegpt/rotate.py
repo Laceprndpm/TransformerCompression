@@ -137,6 +137,12 @@ def rotate_and_slice(
         rotate_and_slice_sequential(model_adapter, dataloader, slicing_scheduler, apply_mask, final_orientation)
 
 
+def _apply_random_index_selection(Q: torch.Tensor) -> torch.Tensor:
+    """Randomly permute PCA components so slicing keeps a random subset."""
+    perm = torch.randperm(Q.shape[0], device=Q.device)
+    return Q[:, perm]
+
+
 @torch.no_grad()
 def rotate_and_slice_sequential(
     model_adapter: ModelAdapter,
@@ -171,6 +177,8 @@ def rotate_and_slice_sequential(
     if final_orientation == 'random':
         R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0])
         Q = Q @ R.to(Q.device)
+    elif final_orientation == 'pca_random_index':
+        Q = _apply_random_index_selection(Q)
     rotate_embeddings(model_adapter, Q)
     slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
 
@@ -200,6 +208,8 @@ def rotate_and_slice_sequential(
                 Q.shape[0], slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
             )
             Q = Q @ R.to(Q.device)
+        elif final_orientation == 'pca_random_index':
+            Q = _apply_random_index_selection(Q)
 
         layer.attn_shortcut_Q = nn.Parameter(
             torch.matmul(
@@ -228,6 +238,10 @@ def rotate_and_slice_sequential(
         if final_orientation == 'random':
             R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_mlp_output_dimension(idx))
             Q = Q @ R.to(Q.device)
+        elif final_orientation == 'pca_random_index':
+            Q = _apply_random_index_selection(Q)
+        elif final_orientation == 'pca_random_index':
+            Q = _apply_random_index_selection(Q)
 
         layer.mlp_shortcut_Q = nn.Parameter(torch.matmul(layer.mlp_shortcut_Q, Q.to(dtype=dtype)))
 
@@ -285,6 +299,8 @@ def rotate_and_slice_parallel(
     if final_orientation == 'random':
         R = random_orthogonal_upper_left(Q.shape[0], slicing_scheduler.get_embedding_dimensions()[0])
         Q = Q @ R.to(Q.device)
+    elif final_orientation == 'pca_random_index':
+        Q = _apply_random_index_selection(Q)
     rotate_embeddings(model_adapter, Q)
     slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
 

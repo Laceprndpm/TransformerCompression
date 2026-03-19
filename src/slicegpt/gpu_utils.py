@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import torch
+import contextlib
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.utils import get_balanced_memory
 from torch.utils.data import DataLoader
@@ -37,10 +38,26 @@ def evaluate_ppl(
     nlls = []
 
     logging.info("Evaluating perplexity...")
+    # Use autocast when model weights are in low precision to avoid dtype mismatches.
+    try:
+        sample_param = next(model.parameters())
+        model_device = sample_param.device
+        param_dtype = sample_param.dtype
+    except StopIteration:
+        model_device = config.device
+        param_dtype = torch.float32
+
+    use_autocast = model_device.type == "cuda" and param_dtype in (torch.float16, torch.bfloat16)
+    if use_autocast:
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=param_dtype)
+    else:
+        autocast_ctx = contextlib.nullcontext()
+
     for batch in testloader:
         logging.debug(f"Evaluating batch {len(nlls)}")
         batch = utils.map_tensors(batch, config.device)
-        logits = model(**batch).logits
+        with autocast_ctx:
+            logits = model(**batch).logits
 
         # shift outputs and labels autoregressively.
         logits = logits[:, :-1, :]

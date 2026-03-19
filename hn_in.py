@@ -12,7 +12,7 @@ import sys
 import torch
 import wandb
 import torch.distributed as dist
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -194,6 +194,31 @@ def slicing_main(args: argparse.Namespace) -> None:
         else:
             model.to(config.device)
 
+    hn_ckpt_path = None
+    hn_out_dir_used = None
+
+    def apply_hn_gates_from_ckpt(ckpt_path: str) -> None:
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            logging.warning(f"HN checkpoint not found for gating: {ckpt_path}")
+            return
+
+        reg = collect_info_reg_llama(model, p=args.hn_p, lam=args.hn_lam)
+        hn_helper = help_functions_hn(reg.structures)
+
+        hn_state = torch.load(ckpt_path, map_location="cpu")
+        if any(k.startswith("module.") for k in hn_state.keys()):
+            hn_state = {k.replace("module.", "", 1): v for k, v in hn_state.items()}
+
+        hn = hypernetwork(t_structures=reg.structures)
+        hn.load_state_dict(hn_state)
+        hn.to(config.device)
+        hn.eval()
+        with torch.no_grad():
+            vectors = hn()
+
+        hn_helper.set_gate_vectors(model, vectors)
+        hn_helper.set_gate_status(model, use_gate=True)
+
     dataset = data_utils.get_dataset(args.cal_dataset)
     train_dataset, test_dataset = dataset["train"], dataset["test"]
     # train_loader = data_utils.prepare_dataloader(
@@ -227,11 +252,13 @@ def slicing_main(args: argparse.Namespace) -> None:
         if args.hn_use_bf16:
             data_type = torch.bfloat16
 
+        nonlocal hn_ckpt_path, hn_out_dir_used
         hn_out_dir = args.hn_out_dir
         if hn_out_dir is None:
             user_name = "user"
             date_time_obj = datetime.datetime.now()
             hn_out_dir = os.path.join("/output/", user_name, date_time_obj.strftime("%Y%m%d-%H%M%S"))
+        hn_out_dir_used = hn_out_dir
 
         if args.hn_seed is None:
             args.hn_seed = args.hn_start_iter
@@ -291,6 +318,9 @@ def slicing_main(args: argparse.Namespace) -> None:
                 model.to(data_type)
             model_to_train = DDP(model)
 
+        # Explicitly enable gate usage during HN training.
+        hn_helper.set_gate_status(model_to_train, use_gate=True)
+
         # Freeze model params; only train hn.
         for param in model_to_train.parameters():
             param.requires_grad = False
@@ -310,7 +340,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             scheduler = None
 
         # CHANGED: use GradScaler for AMP to match DISP on single process.
-        scaler = GradScaler()
+        scaler = GradScaler("cuda")
         iter_num = args.hn_start_iter
 
         while True:
@@ -329,9 +359,12 @@ def slicing_main(args: argparse.Namespace) -> None:
                     hn_helper.set_gate_vectors(model_to_train, vectors)
                     output = model_to_train(input_ids)
                     logits = output.logits if hasattr(output, "logits") else output
+                    # Shift for autoregressive loss (match DISP-LLM).
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_targets = targets[:, 1:].contiguous()
                     ce_loss = torch.nn.functional.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        targets.view(-1),
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_targets.view(-1),
                         # CHANGED: SliceGPT dataloader pads; ignore pad tokens if available.
                         ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100,
                     )
@@ -372,17 +405,27 @@ def slicing_main(args: argparse.Namespace) -> None:
             if iter_num >= args.hn_steps:
                 break
 
+        # After training, apply hard gates for a stable evaluation pass.
+        if hasattr(hn, "module"):
+            hard_out = hn.module.hard_output()
+        else:
+            hard_out = hn.hard_output()
+        hn_helper.set_gate_vectors(model_to_train, hard_out)
+        hn_helper.set_gate_status(model_to_train, use_gate=True)
+
         # Save the hypernetwork checkpoint (match DISP behavior).
         if env.world_size == 1:
             if env.global_rank == 0:
-                torch.save(hn.state_dict(), os.path.join(hn_out_dir, f"hn-ckpt-final-{args.hn_p:.2f}.pt"))
+                hn_ckpt_path = os.path.join(hn_out_dir, f"hn-ckpt-final-{args.hn_p:.2f}.pt")
+                torch.save(hn.state_dict(), hn_ckpt_path)
         else:
             if hasattr(hn, "module"):
                 state_dict_hn = hn.module.state_dict()
             else:
                 state_dict_hn = hn.state_dict()
             if env.global_rank == 0:
-                torch.save(state_dict_hn, os.path.join(hn_out_dir, f"hn-ckpt-final-{args.hn_p:.2f}.pt"))
+                hn_ckpt_path = os.path.join(hn_out_dir, f"hn-ckpt-final-{args.hn_p:.2f}.pt")
+                torch.save(state_dict_hn, hn_ckpt_path)
 
     if args.train_hn:
         train_hn()
@@ -390,10 +433,11 @@ def slicing_main(args: argparse.Namespace) -> None:
     # evaluate perplexity and exit if sliced model is loaded or if ppl_only is set
     if args.sliced_model_path or args.ppl_only:
         reset_model_device()
+        if hn_ckpt_path:
+            apply_hn_gates_from_ckpt(hn_ckpt_path)
         dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
-        logging.info(f'Loaded model perplexity: {dataset_ppl}')
+        logging.info(f'Loaded model(gated) perplexity: {dataset_ppl}')
         wandb.log({"original_ppl": dataset_ppl})
-    ipdb.set_trace()
     # # original ppl
     # if args.eval_baseline:
     #     reset_model_device()

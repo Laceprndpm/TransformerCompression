@@ -1,0 +1,83 @@
+# =========================
+# Git / meta
+# =========================
+.git
+.gitignore
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# =========================
+# VS Code（只保留配置）
+# =========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# =========================
+# Logs / tracking
+# =========================
+wandb/
+experiments/wandb/
+log/
+logs/
+*.log
+
+# =========================
+# Models / checkpoints（关键）
+# =========================
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# =========================
+# Experiment outputs（你项目重点）
+# =========================
+experiments/results*
+experiments/sliced_models
+outputs/
+
+# =========================
+# Dataset（强烈建议排除）
+# =========================
+data/
+datasets/
+cache/
+*.arrow
+
+# =========================
+# Environment
+# =========================
+.env
+.venv
+venv/
+env/
+ENV/
+
+# =========================
+# Build / dist
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints
+
+# =========================
+# OS / misc
+# =========================
+.DS_Store
+Thumbs.db
+*~

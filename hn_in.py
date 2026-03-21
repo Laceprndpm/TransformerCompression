@@ -31,6 +31,7 @@ from slicegpt.slicing_scheduler import ConstSlicingScheduler
 sys.path.append(str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from src.disp.utils.distributed_env import DistributedEnv
+from src.disp.data import dataloader_creator, load_hf_dataset_wikitext
 from src.disp.pruning.hypernetwork import hypernetwork
 from src.disp.pruning.pruning_helper import collect_info_reg_phi2, help_functions_hn
 
@@ -220,7 +221,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         hn_helper.set_gate_status(model, use_gate=True)
 
     dataset = data_utils.get_dataset(args.cal_dataset)
-    train_dataset, test_dataset = dataset["train"], dataset["test"]
+    _, test_dataset = dataset["train"], dataset["test"]
     # train_loader = data_utils.prepare_dataloader(
     #     dataset=train_dataset,
     #     tokenizer=tokenizer,
@@ -274,15 +275,22 @@ def slicing_main(args: argparse.Namespace) -> None:
         model.config.use_cache = False
         model.to(device_id)
 
-        # CHANGED: use SliceGPT dataloader (tokenizes and creates labels).
-        train_loader = data_utils.prepare_dataloader(
-            dataset=train_dataset,
+        ignored_token = tokenizer.bos_token_id
+        if ignored_token is None:
+            ignored_token = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+        train_dataset_hn = load_hf_dataset_wikitext("train", env.world_size * args.hn_num_workers)
+        train_loader = dataloader_creator(
+            dataset=train_dataset_hn,
             tokenizer=tokenizer,
-            max_seqlen=args.hn_block_size,
             batch_size=args.hn_batch_size,
-            nsamples=args.cal_nsamples,
-            varied_seqlen=args.varied_seqlen,
-            seed=args.seed,
+            block_size=args.hn_block_size,
+            num_workers=args.hn_num_workers,
+            cycling=False,
+            rank=env.global_rank,
+            world_size=env.world_size,
+            ignored_token=ignored_token,
+            shuffle_seed=args.hn_seed,
         )
 
         # collect pruning info and build hypernetwork
@@ -351,22 +359,16 @@ def slicing_main(args: argparse.Namespace) -> None:
                 with torch.no_grad():
                     input_ids = batch["input_ids"].to(device_id)
                     targets = batch["labels"].to(device_id)
-                    input_ids = input_ids[:, : args.hn_block_size]
-                    targets = targets[:, : args.hn_block_size]
 
                 with autocast(device_type="cuda", dtype=data_type):
                     vectors = hn()
                     hn_helper.set_gate_vectors(model_to_train, vectors)
                     output = model_to_train(input_ids)
                     logits = output.logits if hasattr(output, "logits") else output
-                    # Shift for autoregressive loss (match DISP-LLM).
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_targets = targets[:, 1:].contiguous()
                     ce_loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_targets.view(-1),
-                        # CHANGED: SliceGPT dataloader pads; ignore pad tokens if available.
-                        ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100,
+                        logits.view(-1, logits.size(-1)),
+                        targets.view(-1),
+                        ignore_index=ignored_token,
                     )
 
                     if hasattr(hn, "module"):

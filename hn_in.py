@@ -32,7 +32,7 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from src.disp.utils.distributed_env import DistributedEnv
 from src.disp.pruning.hypernetwork import hypernetwork
-from src.disp.pruning.pruning_helper import collect_info_reg_llama, help_functions_hn
+from src.disp.pruning.pruning_helper import collect_info_reg_phi2, help_functions_hn
 
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
@@ -202,7 +202,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             logging.warning(f"HN checkpoint not found for gating: {ckpt_path}")
             return
 
-        reg = collect_info_reg_llama(model, p=args.hn_p, lam=args.hn_lam)
+        reg = collect_info_reg_phi2(model, p=args.hn_p, lam=args.hn_lam)
         hn_helper = help_functions_hn(reg.structures)
 
         hn_state = torch.load(ckpt_path, map_location="cpu")
@@ -286,7 +286,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         )
 
         # collect pruning info and build hypernetwork
-        param_reg = collect_info_reg_llama(model, p=args.hn_p, lam=args.hn_lam)
+        param_reg = collect_info_reg_phi2(model, p=args.hn_p, lam=args.hn_lam)
         hn = hypernetwork(t_structures=param_reg.structures)
         hn_helper = help_functions_hn(param_reg.structures)
 

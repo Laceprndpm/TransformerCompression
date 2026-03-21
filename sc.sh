@@ -25,8 +25,8 @@ torchrun --standalone --nproc_per_node=1 hn_in.py \
         --train-hn \
         --hn-lam 6 \
         --hn-p 0.7 \
-        --hn-steps 10000 \
+        --hn-steps 10 \
         --hn-use-bf16 \
-        --hn-block-size 512 \
+        --hn-block-size 1 \
         --dtype fp32 \
         --hn-out-dir models/step2/exp \

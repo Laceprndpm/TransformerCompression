@@ -90,6 +90,84 @@ class collect_info_reg_llama(nn.Module):
 
         return self.lam * loss
 
+
+class collect_info_reg_phi2(nn.Module):
+    def __init__(self, model, p=None, lam=4.0):
+        super(collect_info_reg_phi2, self).__init__()
+        self.sum_ori_params = 0
+        self.p = p
+        self.lam = lam
+        self.in_dim_list = []
+        self.out_dim_list = []
+        self.num_w_list = []
+        self.structures = []
+        self.gate_type = []
+
+        modules = list(model.modules())
+        for layer_id in range(len(modules)):
+            m = modules[layer_id]
+            if type(m).__name__ == 'virtual_block_basic_operation':
+                self.structures.append(m.dim)
+                self.in_dim_list.append(None)
+                self.out_dim_list.append(None)
+                self.num_w_list.append(None)
+                self.gate_type.append('mlp_block')
+            if type(m).__name__ == 'virtual_mlp_operation':
+                ori_param = m.get_parameters()
+                self.sum_ori_params += ori_param
+                self.in_dim_list.append(m.ex_dict['dim_1'])
+                self.out_dim_list.append(m.ex_dict['dim_2'])
+                self.num_w_list.append(m.ex_dict['num_weight'])
+                self.structures.append(m.dim)
+                self.gate_type.append('mlp')
+            if type(m).__name__ == 'virtual_block_attn_operation':
+                ori_param = m.get_parameters()
+                self.sum_ori_params += ori_param
+                self.in_dim_list.append(m.ex_dict['dim_1'])
+                self.out_dim_list.append(m.ex_dict['dim_2'])
+                self.num_w_list.append(m.ex_dict['num_weight'])
+                self.structures.append(m.dim)
+                self.head_dim = m.head_dim
+                self.num_heads = m.dim
+                self.gate_type.append('attn_block')
+            if type(m).__name__ == 'virtual_basic_operation':
+                self.structures.append(m.dim)
+                self.in_dim_list.append(None)
+                self.out_dim_list.append(None)
+                self.num_w_list.append(None)
+                self.gate_type.append('basic_gate')
+
+            print("Number of original parameters: %.3f" % (self.sum_ori_params / 10 ** 6))
+
+    def forward(self, vectors):
+        sum_params = 0
+        i = 0
+        while i < len(self.structures):
+            if self.gate_type[i] == 'attn_block':
+                attn_in_dim = vectors[i].sum()
+                attn_out_dim = vectors[i + 1].sum()
+                current_params = attn_in_dim * 3 * self.out_dim_list[i] + attn_out_dim * self.out_dim_list[i]
+                i += 2
+                sum_params += current_params
+
+            if self.gate_type[i] == 'mlp_block':
+                block_mlp_in_dim = vectors[i].sum()
+                block_mlp_middle_dim = vectors[i + 1].sum()
+                block_mlp_out_dim = vectors[i + 2].sum()
+                current_params = block_mlp_in_dim * block_mlp_middle_dim + block_mlp_middle_dim * block_mlp_out_dim
+                i += 3
+                sum_params += current_params
+
+        param_ratio = sum_params / self.sum_ori_params
+        if param_ratio > self.p:
+            clamped_p_ratio = torch.clamp(param_ratio, min=self.p)
+            loss = torch.log(clamped_p_ratio / self.p)
+        else:
+            clamped_p_ratio = torch.clamp(param_ratio, max=self.p)
+            loss = torch.log(self.p / clamped_p_ratio)
+
+        return self.lam * loss
+
 class help_functions_hn(nn.Module):
     def __init__(self, structures, constrained=None):
         self.structures = structures

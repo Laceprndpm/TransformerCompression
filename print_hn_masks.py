@@ -10,7 +10,7 @@ import torch
 
 from slicegpt import hf_utils, layernorm_fusion
 from src.disp.pruning.hypernetwork import hypernetwork
-from src.disp.pruning.pruning_helper import collect_info_reg_llama, help_functions_hn
+from src.disp.pruning.pruning_helper import collect_info_reg_phi2, help_functions_hn
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +71,7 @@ def main() -> None:
     model = model_adapter.model
 
     # Build structures for HN
-    reg = collect_info_reg_llama(model, p=args.hn_p, lam=args.hn_lam)
+    reg = collect_info_reg_phi2(model, p=args.hn_p, lam=args.hn_lam)
     hn_helper = help_functions_hn(reg.structures)
 
     # Load HN checkpoint (strip DDP prefix if needed)

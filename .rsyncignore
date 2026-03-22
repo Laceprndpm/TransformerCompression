@@ -49,7 +49,6 @@ outputs/
 # =========================
 # Dataset（强烈建议排除）
 # =========================
-data/
 datasets/
 cache/
 *.arrow

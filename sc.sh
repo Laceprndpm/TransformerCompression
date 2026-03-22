@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=1 hn_in.py \
         --device cuda:0 \
         --no-wandb \
         --train-hn \
-        --hn-lam 6 \
+        --hn-lam 1 \
         --hn-p 0.7 \
         --hn-steps 10 \
         --hn-use-bf16 \

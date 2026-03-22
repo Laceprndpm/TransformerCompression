@@ -69,6 +69,7 @@ def main() -> None:
         layernorm_fusion.fuse_modules(model_adapter)
 
     model = model_adapter.model
+    original_total_params = sum(p.numel() for p in model.parameters())
 
     # Build structures for HN
     reg = collect_info_reg_phi2(model, p=args.hn_p, lam=args.hn_lam)
@@ -87,13 +88,24 @@ def main() -> None:
     with torch.no_grad():
         vectors = hn()
 
+    pruned_prunable_params = reg.count_pruned_parameters(vectors).item()
+    original_prunable_params = reg.sum_ori_params
+    pruned_total_params = original_total_params - original_prunable_params + pruned_prunable_params
+
     # Print summary and masks
+    print(f"original total parameters: {original_total_params / 10**6:.3f}M")
+    print(f"original prunable parameters: {original_prunable_params / 10**6:.3f}M")
+    print(f"pruned prunable parameters: {pruned_prunable_params / 10**6:.3f}M")
+    print(f"estimated total parameters after pruning: {pruned_total_params / 10**6:.3f}M")
+    print(f"estimated kept ratio in prunable params: {pruned_prunable_params / max(original_prunable_params, 1):.4f}")
     hn_helper.print_info(vectors)
     for idx, v in enumerate(vectors):
         v_cpu = v.detach().cpu()
         ones = int(v_cpu.sum().item())
         total = v_cpu.numel()
-        print(f"[{idx}] ones={ones} / {total} ({ones / max(total, 1):.4f})")
+        gate_name = reg.gate_names[idx] if idx < len(reg.gate_names) else "unknown"
+        gate_type = reg.gate_type[idx] if idx < len(reg.gate_type) else "unknown"
+        print(f"[{idx}] {gate_name} ({gate_type}) ones={ones} / {total} ({ones / max(total, 1):.4f})")
         if args.print_full:
             print(v_cpu.int().tolist())
 

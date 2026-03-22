@@ -102,16 +102,16 @@ class collect_info_reg_phi2(nn.Module):
         self.num_w_list = []
         self.structures = []
         self.gate_type = []
+        self.gate_names = []
 
-        modules = list(model.modules())
-        for layer_id in range(len(modules)):
-            m = modules[layer_id]
+        for name, m in model.named_modules():
             if type(m).__name__ == 'virtual_block_basic_operation':
                 self.structures.append(m.dim)
                 self.in_dim_list.append(None)
                 self.out_dim_list.append(None)
                 self.num_w_list.append(None)
                 self.gate_type.append('mlp_block')
+                self.gate_names.append(name)
             if type(m).__name__ == 'virtual_mlp_operation':
                 ori_param = m.get_parameters()
                 self.sum_ori_params += ori_param
@@ -120,6 +120,7 @@ class collect_info_reg_phi2(nn.Module):
                 self.num_w_list.append(m.ex_dict['num_weight'])
                 self.structures.append(m.dim)
                 self.gate_type.append('mlp')
+                self.gate_names.append(name)
             if type(m).__name__ == 'virtual_block_attn_operation':
                 ori_param = m.get_parameters()
                 self.sum_ori_params += ori_param
@@ -130,16 +131,18 @@ class collect_info_reg_phi2(nn.Module):
                 self.head_dim = m.head_dim
                 self.num_heads = m.dim
                 self.gate_type.append('attn_block')
+                self.gate_names.append(name)
             if type(m).__name__ == 'virtual_basic_operation':
                 self.structures.append(m.dim)
                 self.in_dim_list.append(None)
                 self.out_dim_list.append(None)
                 self.num_w_list.append(None)
                 self.gate_type.append('basic_gate')
+                self.gate_names.append(name)
 
             print("Number of original parameters: %.3f" % (self.sum_ori_params / 10 ** 6))
 
-    def forward(self, vectors):
+    def count_pruned_parameters(self, vectors):
         sum_params = 0
         i = 0
         while i < len(self.structures):
@@ -158,6 +161,10 @@ class collect_info_reg_phi2(nn.Module):
                 i += 3
                 sum_params += current_params
 
+        return sum_params
+
+    def forward(self, vectors):
+        sum_params = self.count_pruned_parameters(vectors)
         param_ratio = sum_params / self.sum_ori_params
         if param_ratio > self.p:
             clamped_p_ratio = torch.clamp(param_ratio, min=self.p)

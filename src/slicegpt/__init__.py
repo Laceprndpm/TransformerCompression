@@ -1,7 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from .adapters.llama_adapter import LlamaModelAdapter
+# from .adapters.llama_adapter import LlamaModelAdapter
+from .adapters.llama_disp_adapter import LlamaDispModelAdapter
 from .adapters.opt_adapter import OPTModelAdapter
 from .adapters.phi2_disp_adapter import Phi2DispModelAdapter
 # from .adapters.phi2_adapter import Phi2ModelAdapter

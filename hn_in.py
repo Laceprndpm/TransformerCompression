@@ -33,7 +33,7 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parent / "src"))
 from src.disp.utils.distributed_env import DistributedEnv
 from src.disp.data import dataloader_creator, load_hf_dataset_wikitext
 from src.disp.pruning.hypernetwork import hypernetwork
-from src.disp.pruning.pruning_helper import collect_info_reg_phi2, help_functions_hn
+from src.disp.pruning.pruning_helper import collect_info_reg_llama, collect_info_reg_phi2, help_functions_hn
 
 
 def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
@@ -139,6 +139,13 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
     parser.add_argument('--hn-use-sch', action="store_true", help="Use cosine scheduler for hn.")
     parser.add_argument('--hn-use-bf16', action="store_true", help="Use bf16 for hn training.")
     parser.add_argument('--hn-out-dir', type=str, default=None, help="Output dir to save hn checkpoint.")
+    parser.add_argument(
+        '--hn-model-kind',
+        type=str,
+        choices=["llama", "phi2"],
+        default=None,
+        help="Model kind for HN regularization/structure collection. Controls which collect_info_reg_* function is used.",
+    )
 
     return parser.parse_args() if interactive else parser.parse_args('')
 
@@ -159,6 +166,25 @@ def process_slicing_args(args):
         config.dtype = torch.float32
     else:
         raise argparse.ArgumentTypeError(f"Data type should be one of 'fp16', 'fp32'")
+
+    if args.train_hn and args.hn_model_kind is None:
+        raise argparse.ArgumentTypeError(
+            "When using --train-hn, you must also pass --hn-model-kind {llama,phi2}. Example: --hn-model-kind phi2"
+        )
+
+
+def build_param_reg(model, args):
+    if args.hn_model_kind is None:
+        raise ValueError(
+            "HN model kind is required to build pruning structures. Pass --hn-model-kind {llama,phi2}. "
+            "Example: --hn-model-kind phi2"
+        )
+
+    reg_builders = {
+        "llama": collect_info_reg_llama,
+        "phi2": collect_info_reg_phi2,
+    }
+    return reg_builders[args.hn_model_kind](model, p=args.hn_p, lam=args.hn_lam)
 
 
 def slicing_main(args: argparse.Namespace) -> None:
@@ -203,7 +229,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             logging.warning(f"HN checkpoint not found for gating: {ckpt_path}")
             return
 
-        reg = collect_info_reg_phi2(model, p=args.hn_p, lam=args.hn_lam)
+        reg = build_param_reg(model, args)
         hn_helper = help_functions_hn(reg.structures)
 
         hn_state = torch.load(ckpt_path, map_location="cpu")
@@ -294,7 +320,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         )
 
         # collect pruning info and build hypernetwork
-        param_reg = collect_info_reg_phi2(model, p=args.hn_p, lam=args.hn_lam)
+        param_reg = build_param_reg(model, args)
         hn = hypernetwork(t_structures=param_reg.structures)
         hn_helper = help_functions_hn(param_reg.structures)
 

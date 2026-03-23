@@ -279,6 +279,7 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
+        attn_implementation: str | None = None,
     ) -> ModelAdapter | None:
         if not (
             model_name.startswith("meta-llama/Llama-2")
@@ -286,12 +287,15 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
         ):
             return None
 
-        model = LlamaForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            token=token,
-            local_files_only=local_files_only,
-        )
+        model_kwargs = {
+            "torch_dtype": dtype,
+            "token": token,
+            "local_files_only": local_files_only,
+        }
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
+
+        model = LlamaForCausalLM.from_pretrained(model_path, **model_kwargs)
         model.config.torch_dtype = dtype
 
         return cls(model)
@@ -305,6 +309,7 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
+        attn_implementation: str | None = None,
     ) -> ModelAdapter | None:
         if not (
             model_name.startswith("meta-llama/Llama-2")
@@ -322,6 +327,8 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
             token=token,
             local_files_only=local_files_only,
         )
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         model = UninitializedLlamaForCausalLM(config)
         model = model.to(dtype=dtype)
 

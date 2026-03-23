@@ -49,6 +49,7 @@ def get_model_and_tokenizer(
     uninitialized: bool = False,
     dtype: torch.dtype = torch.float16,
     token: str | bool | None = None,
+    attn_implementation: str | None = None,
 ) -> tuple[ModelAdapter, PreTrainedTokenizerBase]:
     """
     Load the model and the tokenizer from the given path.
@@ -95,6 +96,7 @@ def get_model_and_tokenizer(
         dtype=dtype,
         local_files_only=local_model,
         token=token,
+        attn_implementation=attn_implementation,
     )
 
     model = model_adapter.model
@@ -119,6 +121,7 @@ def load_sliced_model(
     lora_config: Any = None,
     sparsity: float | None = None,
     round_interval: int | None = 1,
+    attn_implementation: str | None = None,
 ) -> tuple[ModelAdapter, PreTrainedTokenizerBase]:
     """
     Load the sliced model and the tokenizer from the given path. If lora_config: peft.LoraConfig is supplied
@@ -136,6 +139,7 @@ def load_sliced_model(
         model_path=sliced_model_path,
         uninitialized=True,
         token=token,
+        attn_implementation=attn_implementation,
     )
     replace_layers(model_adapter)
     fuse_modules(model_adapter)

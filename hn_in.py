@@ -192,6 +192,13 @@ def slicing_arg_parser() -> argparse.Namespace:
         default=True,
         help="Enable the middle virtual_gate where supported. Use --no-use-virtual-gate to disable it.",
     )
+    parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        choices=["eager", "sdpa", "flash_attention_2"],
+        default=None,
+        help="Optional Hugging Face attention implementation override for LLaMA models.",
+    )
 
     return parser.parse_args()
 
@@ -252,11 +259,16 @@ def slicing_main(args: argparse.Namespace) -> None:
             sparsity=FIXED_SPARSITY,
             round_interval=FIXED_ROUND_INTERVAL,
             token=args.hf_token,
+            attn_implementation=args.attn_implementation,
         )
     else:
         # load one of the pre-trained models
         model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(
-            args.model, args.model_path, token=args.hf_token, dtype=config.dtype
+            args.model,
+            args.model_path,
+            token=args.hf_token,
+            dtype=config.dtype,
+            attn_implementation=args.attn_implementation,
         )
     model = model_adapter.model
 

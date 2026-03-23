@@ -314,6 +314,7 @@ class ModelAdapter(ABC):
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
+        attn_implementation: str | None = None,
     ) -> ModelAdapter:
         """
         Create the model based on the given name path and return the corresponding ModelAdapter instance.
@@ -352,6 +353,7 @@ class ModelAdapter(ABC):
                 dtype=dtype,
                 local_files_only=local_files_only,
                 token=token,
+                attn_implementation=attn_implementation,
             )
 
         adapter = find_recursively(cls)
@@ -370,6 +372,7 @@ class ModelAdapter(ABC):
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
+        attn_implementation: str | None = None,
     ) -> ModelAdapter | None:
         match model_type:
             case 'pretrained':
@@ -379,6 +382,7 @@ class ModelAdapter(ABC):
                     dtype=dtype,
                     local_files_only=local_files_only,
                     token=token,
+                    attn_implementation=attn_implementation,
                 )
 
             case 'uninitialized':
@@ -388,6 +392,7 @@ class ModelAdapter(ABC):
                     dtype=dtype,
                     local_files_only=local_files_only,
                     token=token,
+                    attn_implementation=attn_implementation,
                 )
             case _:
                 raise ValueError(f"Unknown model type: {model_type}")
@@ -402,6 +407,7 @@ class ModelAdapter(ABC):
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
+        attn_implementation: str | None = None,
     ) -> ModelAdapter | None:
         """
         Load the pretrained model from the given path and return a ModelAdapter instance.
@@ -420,6 +426,7 @@ class ModelAdapter(ABC):
         dtype: torch.dtype = torch.float16,
         local_files_only: bool = False,
         token: str | bool | None = None,
+        attn_implementation: str | None = None,
     ) -> ModelAdapter | None:
         """
         Create an uninitialized model from the given path and return a ModelAdapter instance.

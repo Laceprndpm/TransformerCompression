@@ -6,6 +6,8 @@ from inspect import get_annotations
 from typing import Any, Protocol, runtime_checkable
 
 import pytest
+import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Module, Parameter
 from transformers.models.llama.modeling_llama import LlamaConfig, LlamaForCausalLM
@@ -14,6 +16,7 @@ from transformers.models.phi3.modeling_phi3 import Phi3Config, Phi3ForCausalLM
 from transformers.models.phi.modeling_phi import PhiConfig, PhiForCausalLM
 
 from slicegpt.adapters.llama_adapter import LlamaModelAdapter
+from slicegpt.adapters.llama_disp_adapter import LlamaDispModelAdapter
 from slicegpt.adapters.opt_adapter import OPTModelAdapter
 from slicegpt.adapters.phi2_adapter import Phi2ModelAdapter
 from slicegpt.adapters.phi3_adapter import Phi3ModelAdapter
@@ -125,6 +128,114 @@ class TestLlamaAdapter(ModelAdapterTestBase):
         )
         model = LlamaForCausalLM(config)
         return LlamaModelAdapter(model)
+
+
+def _make_llama_disp_adapter(*, pretraining_tp: int, intermediate_size: int = 32) -> LlamaDispModelAdapter:
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        max_position_embeddings=16,
+        pretraining_tp=pretraining_tp,
+    )
+    model = LlamaForCausalLM(config)
+    return LlamaDispModelAdapter(model)
+
+
+def _set_gate_vectors_to_ones(compressed_layer: Module) -> None:
+    compressed_layer.virtual_attn_gate_1.set_vector_value(
+        torch.ones_like(compressed_layer.virtual_attn_gate_1.pruning_vector)
+    )
+    compressed_layer.virtual_attn_gate_2.set_vector_value(
+        torch.ones_like(compressed_layer.virtual_attn_gate_2.pruning_vector)
+    )
+    compressed_layer.virtual_block_gate_1.set_vector_value(
+        torch.ones_like(compressed_layer.virtual_block_gate_1.pruning_vector)
+    )
+    compressed_layer.virtual_gate.set_vector_value(
+        torch.ones_like(compressed_layer.virtual_gate.pruning_vector)
+    )
+    compressed_layer.virtual_block_gate_2.set_vector_value(
+        torch.ones_like(compressed_layer.virtual_block_gate_2.pruning_vector)
+    )
+
+
+def _reference_tp_gated_mlp(layer: Module, hidden_states: Tensor) -> Tensor:
+    mlp_inputs = layer.virtual_block_gate_1(hidden_states)
+    slice_size = layer.mlp.intermediate_size // layer.config.pretraining_tp
+    gate_proj_slices = layer.mlp.gate_proj.weight.split(slice_size, dim=0)
+    up_proj_slices = layer.mlp.up_proj.weight.split(slice_size, dim=0)
+    down_proj_slices = layer.mlp.down_proj.weight.split(slice_size, dim=1)
+
+    gate_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in gate_proj_slices], dim=-1)
+    up_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in up_proj_slices], dim=-1)
+    intermediate_states = (
+        layer.virtual_gate(layer.mlp.act_fn(gate_hidden)) * layer.virtual_gate(up_hidden)
+    ).split(slice_size, dim=2)
+    outputs = [
+        F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(layer.config.pretraining_tp)
+    ]
+    return layer.virtual_block_gate_2(sum(outputs))
+
+
+class TestLlamaDispAdapter(ModelAdapterTestBase):
+    def create_adapter(self) -> LlamaDispModelAdapter:
+        return _make_llama_disp_adapter(pretraining_tp=1)
+
+    @pytest.mark.parametrize("pretraining_tp", [1, 2])
+    def test_gated_forward_runs_for_supported_tp(self, pretraining_tp: int) -> None:
+        model_adapter = _make_llama_disp_adapter(pretraining_tp=pretraining_tp)
+        original_layer = model_adapter.get_layers()[0].layer
+        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
+        compressed_layer.use_gate = True
+
+        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
+        outputs = compressed_layer(hidden_states, use_cache=False)
+
+        assert outputs[0].shape == hidden_states.shape
+
+    def test_gated_tp_path_matches_reference_implementation(self) -> None:
+        model_adapter = _make_llama_disp_adapter(pretraining_tp=2)
+        original_layer = model_adapter.get_layers()[0].layer
+        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
+        compressed_layer.use_gate = True
+        _set_gate_vectors_to_ones(compressed_layer)
+
+        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
+        normalized_hidden_states = compressed_layer.post_attention_layernorm(hidden_states)
+
+        actual = compressed_layer._apply_gated_mlp(normalized_hidden_states)
+        expected = _reference_tp_gated_mlp(compressed_layer, normalized_hidden_states)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_non_gated_path_matches_original_layer(self) -> None:
+        model_adapter = _make_llama_disp_adapter(pretraining_tp=2)
+        original_layer = model_adapter.get_layers()[0].layer
+        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
+        compressed_layer.use_gate = False
+        original_layer.eval()
+        compressed_layer.eval()
+
+        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
+        actual = compressed_layer(hidden_states, use_cache=False)[0]
+        expected = original_layer(hidden_states, use_cache=False)[0]
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_gated_tp_path_raises_for_invalid_intermediate_size(self) -> None:
+        model_adapter = _make_llama_disp_adapter(pretraining_tp=3, intermediate_size=10)
+        original_layer = model_adapter.get_layers()[0].layer
+        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
+        compressed_layer.use_gate = True
+
+        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
+        normalized_hidden_states = compressed_layer.post_attention_layernorm(hidden_states)
+
+        with pytest.raises(ValueError, match="intermediate_size"):
+            compressed_layer._apply_gated_mlp(normalized_hidden_states)
 
 
 class TestPhi2Adapter(ModelAdapterTestBase):

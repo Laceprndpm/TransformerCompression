@@ -6,7 +6,10 @@
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 # https://www.apache.org/licenses/LICENSE-2.0
 
+import logging
+
 import torch
+import torch.nn.functional as F
 from torch import FloatTensor, LongTensor, Tensor, matmul
 from torch.nn import Linear, Module
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
@@ -52,6 +55,43 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         self.virtual_block_gate_1 = virtual_block_basic_operation(dim=config.hidden_size)
         self.virtual_gate = virtual_mlp_operation(dim=config.intermediate_size, ex_dict=ex_dict_mlp)
         self.virtual_block_gate_2 = virtual_basic_operation(dim=config.hidden_size)
+        self._warned_pretraining_tp_gated_mlp = False
+
+    def _apply_gated_mlp(self, hidden_states: Tensor) -> Tensor:
+        mlp_inputs = self.virtual_block_gate_1(hidden_states)
+        pretraining_tp = self.config.pretraining_tp
+
+        if pretraining_tp <= 1:
+            gate_hidden = self.mlp.gate_proj(mlp_inputs)
+            up_hidden = self.mlp.up_proj(mlp_inputs)
+            hidden_states = self.mlp.down_proj(
+                self.virtual_gate(self.mlp.act_fn(gate_hidden)) * self.virtual_gate(up_hidden)
+            )
+            return self.virtual_block_gate_2(hidden_states)
+
+        if not self._warned_pretraining_tp_gated_mlp:
+            logging.warning("Using gated Llama MLP with pretraining_tp=%s", pretraining_tp)
+            self._warned_pretraining_tp_gated_mlp = True
+
+        if self.mlp.intermediate_size % pretraining_tp != 0:
+            raise ValueError(
+                f"intermediate_size ({self.mlp.intermediate_size}) must be divisible by pretraining_tp "
+                f"({pretraining_tp}) for gated Llama MLP support."
+            )
+
+        slice_size = self.mlp.intermediate_size // pretraining_tp
+        gate_proj_slices = self.mlp.gate_proj.weight.split(slice_size, dim=0)
+        up_proj_slices = self.mlp.up_proj.weight.split(slice_size, dim=0)
+        down_proj_slices = self.mlp.down_proj.weight.split(slice_size, dim=1)
+
+        gate_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in gate_proj_slices], dim=-1)
+        up_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in up_proj_slices], dim=-1)
+
+        intermediate_states = (
+            self.virtual_gate(self.mlp.act_fn(gate_hidden)) * self.virtual_gate(up_hidden)
+        ).split(slice_size, dim=2)
+        hidden_states = sum(F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(pretraining_tp))
+        return self.virtual_block_gate_2(hidden_states)
 
     def forward(
         self,
@@ -93,16 +133,9 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if self.use_gate and self.config.pretraining_tp <= 1:
-            mlp_inputs = self.virtual_block_gate_1(hidden_states)
-            gate_hidden = self.mlp.gate_proj(mlp_inputs)
-            up_hidden = self.mlp.up_proj(mlp_inputs)
-            hidden_states = self.mlp.down_proj(
-                self.virtual_gate(self.mlp.act_fn(gate_hidden)) * self.virtual_gate(up_hidden)
-            )
-            hidden_states = self.virtual_block_gate_2(hidden_states)
+        if self.use_gate:
+            hidden_states = self._apply_gated_mlp(hidden_states)
         else:
-            # TODO: Add gated support for pretraining_tp > 1 if we need it during tuning.
             hidden_states = self.mlp(hidden_states)
 
         # TODO: Tune the residual merge for the MLP branch.

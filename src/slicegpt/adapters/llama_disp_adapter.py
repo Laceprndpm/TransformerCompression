@@ -30,6 +30,7 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
 
     def __init__(self, config: LlamaConfig, layer_idx: int | None = None):
         super().__init__(config, layer_idx)
+        self.config = config
 
         head_dim = config.hidden_size // config.num_attention_heads
         ex_dict_attn = {

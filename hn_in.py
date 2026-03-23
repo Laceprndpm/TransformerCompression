@@ -223,6 +223,7 @@ def slicing_main(args: argparse.Namespace) -> None:
 
     hn_ckpt_path = None
     hn_out_dir_used = None
+    eval_model = None
 
     def apply_hn_gates_from_ckpt(ckpt_path: str) -> None:
         if not ckpt_path or not os.path.exists(ckpt_path):
@@ -279,7 +280,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         if args.hn_use_bf16:
             data_type = torch.bfloat16
 
-        nonlocal hn_ckpt_path, hn_out_dir_used
+        nonlocal hn_ckpt_path, hn_out_dir_used, eval_model
         hn_out_dir = args.hn_out_dir
         if hn_out_dir is None:
             user_name = "user"
@@ -440,6 +441,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             hard_out = hn.hard_output()
         hn_helper.set_gate_vectors(model_to_train, hard_out)
         hn_helper.set_gate_status(model_to_train, use_gate=True)
+        eval_model = model_to_train
 
         # Save the hypernetwork checkpoint (match DISP behavior).
         if env.world_size == 1:
@@ -460,10 +462,12 @@ def slicing_main(args: argparse.Namespace) -> None:
 
     # evaluate perplexity and exit if sliced model is loaded or if ppl_only is set
     if args.sliced_model_path or args.ppl_only:
-        reset_model_device()
-        if hn_ckpt_path:
+        if eval_model is None:
+            reset_model_device()
+        if hn_ckpt_path and eval_model is None:
             apply_hn_gates_from_ckpt(hn_ckpt_path)
-        dataset_ppl = gpu_utils.evaluate_ppl(model, model.config.pad_token_id, test_loader)
+        model_for_eval = eval_model if eval_model is not None else model
+        dataset_ppl = gpu_utils.evaluate_ppl(model_for_eval, model.config.pad_token_id, test_loader)
         logging.info(f'Loaded model(gated) perplexity: {dataset_ppl}')
         wandb.log({"original_ppl": dataset_ppl})
     # # original ppl

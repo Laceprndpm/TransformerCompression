@@ -20,6 +20,7 @@ from slicegpt.adapters.llama_disp_adapter import LlamaDispModelAdapter
 from slicegpt.adapters.opt_adapter import OPTModelAdapter
 from slicegpt.adapters.phi2_adapter import Phi2ModelAdapter
 from slicegpt.adapters.phi3_adapter import Phi3ModelAdapter
+from slicegpt.gates import apply_shortcut_gate, virtual_basic_operation
 from slicegpt.model_adapter import ModelAdapter
 
 
@@ -180,6 +181,51 @@ def _reference_tp_gated_mlp(layer: Module, hidden_states: Tensor) -> Tensor:
     return layer.virtual_block_gate_2(sum(outputs))
 
 
+def _reference_llama_disp_layer(layer: Module, hidden_states: Tensor) -> Tensor:
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+
+    attn_inputs = hidden_states
+    if layer.use_gate:
+        attn_inputs = layer.virtual_attn_gate_1(attn_inputs)
+
+    hidden_states, _, _ = layer.self_attn(
+        hidden_states=attn_inputs,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+    )
+    if layer.use_gate:
+        hidden_states = layer.virtual_attn_gate_2(hidden_states)
+
+    if layer.attn_shortcut_Q is not None:
+        shortcut_q = layer.attn_shortcut_Q
+        if layer.use_gate:
+            shortcut_q = apply_shortcut_gate(shortcut_q, layer.virtual_attn_gate_1, layer.virtual_attn_gate_2)
+        hidden_states = torch.matmul(residual, shortcut_q) + hidden_states
+    else:
+        hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = layer.post_attention_layernorm(hidden_states)
+    if layer.use_gate:
+        hidden_states = layer._apply_gated_mlp(hidden_states)
+    else:
+        hidden_states = layer.mlp(hidden_states)
+
+    if layer.mlp_shortcut_Q is not None:
+        shortcut_q = layer.mlp_shortcut_Q
+        if layer.use_gate:
+            shortcut_q = apply_shortcut_gate(shortcut_q, layer.virtual_block_gate_1, layer.virtual_block_gate_2)
+        hidden_states = torch.matmul(residual, shortcut_q) + hidden_states
+    else:
+        hidden_states = residual + hidden_states
+
+    return hidden_states
+
+
 class TestLlamaDispAdapter(ModelAdapterTestBase):
     def create_adapter(self) -> LlamaDispModelAdapter:
         return _make_llama_disp_adapter(pretraining_tp=1)
@@ -236,6 +282,69 @@ class TestLlamaDispAdapter(ModelAdapterTestBase):
 
         with pytest.raises(ValueError, match="intermediate_size"):
             compressed_layer._apply_gated_mlp(normalized_hidden_states)
+
+    def test_apply_shortcut_gate_returns_original_matrix_for_all_one_vectors(self) -> None:
+        input_gate = virtual_basic_operation(dim=3)
+        output_gate = virtual_basic_operation(dim=4)
+        shortcut = torch.randn(3, 4)
+
+        actual = apply_shortcut_gate(shortcut, input_gate, output_gate)
+
+        torch.testing.assert_close(actual, shortcut)
+
+    def test_apply_shortcut_gate_zeroes_expected_rows_and_columns(self) -> None:
+        input_gate = virtual_basic_operation(dim=3)
+        output_gate = virtual_basic_operation(dim=4)
+        input_gate.set_vector_value(torch.tensor([1.0, 0.0, 1.0]))
+        output_gate.set_vector_value(torch.tensor([1.0, 0.0, 1.0, 0.0]))
+        shortcut = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        actual = apply_shortcut_gate(shortcut, input_gate, output_gate)
+        expected = shortcut * torch.tensor([[1.0], [0.0], [1.0]]) * torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_apply_shortcut_gate_raises_for_dimension_mismatch(self) -> None:
+        input_gate = virtual_basic_operation(dim=2)
+        output_gate = virtual_basic_operation(dim=4)
+        shortcut = torch.randn(3, 4)
+
+        with pytest.raises(ValueError, match="input gate dimension"):
+            apply_shortcut_gate(shortcut, input_gate, output_gate)
+
+    def test_gated_shortcut_path_matches_reference_for_all_one_vectors(self) -> None:
+        model_adapter = _make_llama_disp_adapter(pretraining_tp=1)
+        original_layer = model_adapter.get_layers()[0].layer
+        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
+        compressed_layer.use_gate = True
+        compressed_layer.eval()
+        _set_gate_vectors_to_ones(compressed_layer)
+
+        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
+
+        actual = compressed_layer(hidden_states, use_cache=False)[0]
+        expected = _reference_llama_disp_layer(compressed_layer, hidden_states)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_gated_shortcut_path_matches_reference_for_sparse_vectors(self) -> None:
+        model_adapter = _make_llama_disp_adapter(pretraining_tp=1)
+        original_layer = model_adapter.get_layers()[0].layer
+        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
+        compressed_layer.use_gate = True
+        compressed_layer.eval()
+
+        compressed_layer.virtual_attn_gate_1.set_vector_value(torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]))
+        compressed_layer.virtual_attn_gate_2.set_vector_value(torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]))
+        compressed_layer.virtual_block_gate_1.set_vector_value(torch.tensor([1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]))
+        compressed_layer.virtual_block_gate_2.set_vector_value(torch.tensor([0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]))
+
+        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
+
+        actual = compressed_layer(hidden_states, use_cache=False)[0]
+        expected = _reference_llama_disp_layer(compressed_layer, hidden_states)
+
+        torch.testing.assert_close(actual, expected)
 
 
 class TestPhi2Adapter(ModelAdapterTestBase):

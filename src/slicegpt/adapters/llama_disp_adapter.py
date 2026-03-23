@@ -16,6 +16,7 @@ from transformers import PretrainedConfig, PreTrainedTokenizerBase
 from transformers.models.llama.modeling_llama import LlamaConfig, LlamaDecoderLayer, LlamaForCausalLM, LlamaRMSNorm
 
 from slicegpt.gates import (
+    apply_shortcut_gate,
     virtual_basic_operation,
     virtual_block_attn_operation,
     virtual_block_basic_operation,
@@ -125,7 +126,10 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
 
         # TODO: Tune the residual merge for the attention branch.
         if self.attn_shortcut_Q is not None:
-            rotated_residual = matmul(residual, self.attn_shortcut_Q)
+            shortcut_q = self.attn_shortcut_Q
+            if self.use_gate:
+                shortcut_q = apply_shortcut_gate(shortcut_q, self.virtual_attn_gate_1, self.virtual_attn_gate_2)
+            rotated_residual = matmul(residual, shortcut_q)
             hidden_states = rotated_residual + hidden_states
         else:
             hidden_states = residual + hidden_states
@@ -140,7 +144,10 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
 
         # TODO: Tune the residual merge for the MLP branch.
         if self.mlp_shortcut_Q is not None:
-            rotated_residual = matmul(residual, self.mlp_shortcut_Q)
+            shortcut_q = self.mlp_shortcut_Q
+            if self.use_gate:
+                shortcut_q = apply_shortcut_gate(shortcut_q, self.virtual_block_gate_1, self.virtual_block_gate_2)
+            rotated_residual = matmul(residual, shortcut_q)
             hidden_states = rotated_residual + hidden_states
         else:
             hidden_states = residual + hidden_states

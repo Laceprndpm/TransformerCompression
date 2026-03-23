@@ -68,3 +68,26 @@ class virtual_mlp_operation(virtual_basic_operation):
 
     def get_parameters(self):
         return self.ex_dict["dim_1"] * self.ex_dict["dim_2"] * self.ex_dict["num_weight"]
+
+
+def apply_shortcut_gate(
+    shortcut: torch.Tensor,
+    input_gate: virtual_basic_operation,
+    output_gate: virtual_basic_operation,
+) -> torch.Tensor:
+    if shortcut.ndim != 2:
+        raise ValueError(f"shortcut must be a 2D matrix, got shape {tuple(shortcut.shape)}")
+
+    input_mask = input_gate.pruning_vector.to(device=shortcut.device, dtype=shortcut.dtype).reshape(-1, 1)
+    output_mask = output_gate.pruning_vector.to(device=shortcut.device, dtype=shortcut.dtype).reshape(1, -1)
+
+    if input_mask.shape[0] != shortcut.shape[0]:
+        raise ValueError(
+            f"input gate dimension ({input_mask.shape[0]}) must match shortcut rows ({shortcut.shape[0]})."
+        )
+    if output_mask.shape[1] != shortcut.shape[1]:
+        raise ValueError(
+            f"output gate dimension ({output_mask.shape[1]}) must match shortcut cols ({shortcut.shape[1]})."
+        )
+
+    return shortcut * input_mask * output_mask

@@ -5,8 +5,6 @@ import argparse
 import logging
 import os
 import pathlib
-import ipdb
-import shutil
 import datetime
 import sys
 import torch
@@ -17,15 +15,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
-    FullStateDictConfig,
-    StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from functools import partial
 
-from slicegpt import data_utils, gpu_utils, hf_utils, layernorm_fusion, rotate, utils
+from slicegpt import data_utils, gpu_utils, hf_utils, utils
 from slicegpt.config import config
-from slicegpt.slicing_scheduler import ConstSlicingScheduler
 
 # CHANGED: ensure local src/ is importable when running from repo root.
 sys.path.append(str(pathlib.Path(__file__).resolve().parent / "src"))
@@ -39,8 +34,22 @@ from src.disp.pruning.pruning_helper import (
     help_functions_hn,
 )
 
+DEFAULT_MODEL_DTYPE = torch.float32
+DEFAULT_CAL_DATASET = "wikitext2"
+DEFAULT_PPL_EVAL_BATCH_SIZE = 8
+DEFAULT_WANDB_PROJECT = "slicegpt"
+FIXED_SPARSITY = 0.0
+FIXED_ROUND_INTERVAL = 1
 
-def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
+
+def get_disp_amp_dtype() -> torch.dtype:
+    """Match DISP: prefer bf16 when the current CUDA stack supports it, else fp16."""
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def slicing_arg_parser() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
@@ -62,89 +71,6 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
-        "--dtype",
-        type=str,
-        help="Data type to use.",
-        choices=["fp32", "fp16"],
-        default="fp16",
-    )
-    parser.add_argument(
-        "--cal-dataset",
-        type=str,
-        help="Dataset to calibrate and calculate perplexity on.",
-        choices=["wikitext2", "ptb", "c4", "alpaca"],
-        default="wikitext2",
-    )
-    parser.add_argument(
-        "--cal-nsamples",
-        type=int,
-        help="Number of samples of the calibration data to load.",
-        default=128,
-    )
-    parser.add_argument(
-        "--cal-batch-size",
-        type=int,
-        default=16,
-        help="Batch size for loading the calibration data.",
-    )
-    parser.add_argument(
-        "--cal-max-seqlen",
-        type=int,
-        default=2048,
-        help="Maximum sequence length for the calibration data.",
-    )
-    parser.add_argument(
-        "--varied-seqlen",
-        action="store_true",
-        help="Varied sequence lengths in the calibration data.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Seed for sampling the calibration data."
-    )
-    parser.add_argument(
-        "--sparsity",
-        type=float,
-        default=0.0,
-        help="A measure of how much slicing is applied (in the range [0, 1))",
-    )
-    parser.add_argument(
-        "--round-interval",
-        type=int,
-        default=8,
-        help="Interval for rounding the weights (the best value may depend on your hardware)",
-    )
-    parser.add_argument(
-        "--final-orientation",
-        type=str,
-        default="random",
-        choices=["random", "pca", "pca_random_index"],
-        help="Final orientation of the sliced weights.",
-    )
-    parser.add_argument(
-        "--ppl-eval-seqlen",
-        type=int,
-        default=2048,
-        help="Sequence length for evaluating the perplexity.",
-    )
-    parser.add_argument(
-        "--ppl-eval-batch-size",
-        type=int,
-        default=8,
-        help="Batch size for evaluating the perplexity.",
-    )
-    parser.add_argument(
-        "--ppl-eval-nsamples",
-        type=int,
-        default=128,
-        help="Number of samples to evaluate the perplexity on.",
-    )
-    parser.add_argument(
-        "--eval-baseline", action="store_true", help="Evaluate the baseline model."
-    )
-    parser.add_argument(
-        "--eval-fused-model", action="store_true", help="Evaluate the fused model."
-    )
-    parser.add_argument(
         "--ppl-only",
         action="store_true",
         help="Evaluate the loaded model without doing compression.",
@@ -155,14 +81,25 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         help="Use accelerate to put the model on multiple GPUs for evaluation. It is recommended to use it for models with 30B parameters and above.",
     )
 
-    parser.add_argument(
-        "--save-dir", type=str, default=None, help="Path to save the model."
-    )
-
     parser.add_argument("--hf-token", type=str, default=os.getenv("HF_TOKEN", None))
 
     parser.add_argument(
-        "--wandb-project", type=str, default="slicegpt", help="wandb project name."
+        "--wandb-project",
+        type=str,
+        default=DEFAULT_WANDB_PROJECT,
+        help="wandb project name.",
+    )
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="Optional wandb run name.",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Optional wandb entity/team.",
     )
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb.")
     parser.add_argument(
@@ -249,26 +186,26 @@ def slicing_arg_parser(interactive: bool = True) -> argparse.Namespace:
         default=None,
         help="Model kind for HN regularization/structure collection. Controls which collect_info_reg_* function is used.",
     )
+    parser.add_argument(
+        "--use-virtual-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the middle virtual_gate where supported. Use --no-use-virtual-gate to disable it.",
+    )
 
-    return parser.parse_args() if interactive else parser.parse_args("")
+    return parser.parse_args()
 
 
 def process_slicing_args(args):
     for arg, argv in vars(args).items():
         logging.debug(f"{arg} = {argv}")
 
-    if not 0 <= args.sparsity < 1:
-        raise argparse.ArgumentTypeError(f"Sparsity should be in the range [0, 1)")
-
     if args.device:
         config.device = torch.device(args.device)
 
-    if args.dtype == "fp16":
-        config.dtype = torch.float16
-    elif args.dtype == "fp32":
-        config.dtype = torch.float32
-    else:
-        raise argparse.ArgumentTypeError(f"Data type should be one of 'fp16', 'fp32'")
+    # Match DISP more closely: load the base model in fp32, then control runtime precision
+    # with AMP/FSDP inside HN training.
+    config.dtype = DEFAULT_MODEL_DTYPE
 
     if args.train_hn and args.hn_model_kind is None:
         raise argparse.ArgumentTypeError(
@@ -297,6 +234,8 @@ def slicing_main(args: argparse.Namespace) -> None:
     try:
         wandb.init(
             project=args.wandb_project,
+            name=args.wandb_name,
+            entity=args.wandb_entity,
             config=args,
             mode="disabled" if args.no_wandb else None,
         )
@@ -310,8 +249,8 @@ def slicing_main(args: argparse.Namespace) -> None:
         model_adapter, tokenizer = hf_utils.load_sliced_model(
             args.model,
             args.sliced_model_path,
-            sparsity=args.sparsity,
-            round_interval=args.round_interval,
+            sparsity=FIXED_SPARSITY,
+            round_interval=FIXED_ROUND_INTERVAL,
             token=args.hf_token,
         )
     else:
@@ -321,9 +260,16 @@ def slicing_main(args: argparse.Namespace) -> None:
         )
     model = model_adapter.model
 
+    def set_virtual_gate_status(target_model, enabled: bool) -> None:
+        for module in target_model.modules():
+            if hasattr(module, "use_virtual_gate"):
+                module.use_virtual_gate = enabled
+
+    set_virtual_gate_status(model, args.use_virtual_gate)
+
     def reset_model_device() -> None:
         if args.distribute_model:
-            # distribute model across available GPUs
+            # distribute model across available GPUsDEFAULT_DTYPE
             gpu_utils.distribute_model(model_adapter)
         else:
             model.to(config.device)
@@ -353,20 +299,12 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         hn_helper.set_gate_vectors(model, vectors)
         hn_helper.set_gate_status(model, use_gate=True)
+        set_virtual_gate_status(model, args.use_virtual_gate)
 
-    dataset = data_utils.get_dataset(args.cal_dataset)
+    dataset = data_utils.get_dataset(DEFAULT_CAL_DATASET)
     _, test_dataset = dataset["train"], dataset["test"]
-    # train_loader = data_utils.prepare_dataloader(
-    #     dataset=train_dataset,
-    #     tokenizer=tokenizer,
-    #     max_seqlen=args.cal_max_seqlen,
-    #     batch_size=args.cal_batch_size,
-    #     nsamples=args.cal_nsamples,
-    #     varied_seqlen=args.varied_seqlen,
-    #     seed=args.seed,
-    # )
     test_loader = data_utils.prepare_test_dataloader(
-        dataset=test_dataset, tokenizer=tokenizer, batch_size=args.ppl_eval_batch_size
+        dataset=test_dataset, tokenizer=tokenizer, batch_size=DEFAULT_PPL_EVAL_BATCH_SIZE
     )
 
     def train_hn() -> None:
@@ -383,9 +321,12 @@ def slicing_main(args: argparse.Namespace) -> None:
             timeout=datetime.timedelta(seconds=3600 * 5),
         )
 
-        data_type = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        if args.hn_use_bf16:
-            data_type = torch.bfloat16
+        # Follow DISP: AMP prefers bf16 when supported, otherwise fp16.
+        data_type = get_disp_amp_dtype()
+        if args.hn_use_bf16 and data_type != torch.bfloat16:
+            logging.warning(
+                "--hn-use-bf16 was set, but bf16 is not supported on this CUDA setup; falling back to fp16."
+            )
 
         nonlocal hn_ckpt_path, hn_out_dir_used, eval_model
         hn_out_dir = args.hn_out_dir
@@ -472,6 +413,7 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         # Explicitly enable gate usage during HN training.
         hn_helper.set_gate_status(model_to_train, use_gate=True)
+        set_virtual_gate_status(model_to_train, args.use_virtual_gate)
 
         # Freeze model params; only train hn.
         for param in model_to_train.parameters():
@@ -491,8 +433,12 @@ def slicing_main(args: argparse.Namespace) -> None:
         else:
             scheduler = None
 
-        # CHANGED: use GradScaler for AMP to match DISP on single process.
-        scaler = GradScaler("cuda")
+        if args.hn_use_fsdp:
+            from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+
+            scaler = ShardedGradScaler()
+        else:
+            scaler = GradScaler("cuda")
         iter_num = args.hn_start_iter
 
         while True:
@@ -558,6 +504,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             hard_out = hn.hard_output()
         hn_helper.set_gate_vectors(model_to_train, hard_out)
         hn_helper.set_gate_status(model_to_train, use_gate=True)
+        set_virtual_gate_status(model_to_train, args.use_virtual_gate)
         eval_model = model_to_train
 
         # Save the hypernetwork checkpoint (match DISP behavior).

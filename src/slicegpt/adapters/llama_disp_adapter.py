@@ -13,7 +13,12 @@ import torch.nn.functional as F
 from torch import FloatTensor, LongTensor, Tensor, matmul
 from torch.nn import Linear, Module
 from transformers import PretrainedConfig, PreTrainedTokenizerBase
-from transformers.models.llama.modeling_llama import LlamaConfig, LlamaDecoderLayer, LlamaForCausalLM, LlamaRMSNorm
+from transformers.models.llama.modeling_llama import (
+    LlamaConfig,
+    LlamaDecoderLayer,
+    LlamaForCausalLM,
+    LlamaRMSNorm,
+)
 
 from slicegpt.gates import (
     apply_shortcut_gate,
@@ -50,11 +55,18 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         }
 
         self.use_gate = False
-        self.virtual_attn_gate_1 = virtual_block_attn_operation(dim=config.hidden_size, ex_dict=ex_dict_attn)
+        self.use_virtual_gate = True
+        self.virtual_attn_gate_1 = virtual_block_attn_operation(
+            dim=config.hidden_size, ex_dict=ex_dict_attn
+        )
         self.virtual_attn_gate_2 = virtual_basic_operation(dim=config.hidden_size)
 
-        self.virtual_block_gate_1 = virtual_block_basic_operation(dim=config.hidden_size)
-        self.virtual_gate = virtual_mlp_operation(dim=config.intermediate_size, ex_dict=ex_dict_mlp)
+        self.virtual_block_gate_1 = virtual_block_basic_operation(
+            dim=config.hidden_size
+        )
+        self.virtual_gate = virtual_mlp_operation(
+            dim=config.intermediate_size, ex_dict=ex_dict_mlp
+        )
         self.virtual_block_gate_2 = virtual_basic_operation(dim=config.hidden_size)
         self._warned_pretraining_tp_gated_mlp = False
 
@@ -65,13 +77,17 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         if pretraining_tp <= 1:
             gate_hidden = self.mlp.gate_proj(mlp_inputs)
             up_hidden = self.mlp.up_proj(mlp_inputs)
-            hidden_states = self.mlp.down_proj(
-                self.virtual_gate(self.mlp.act_fn(gate_hidden)) * self.virtual_gate(up_hidden)
-            )
+            gate_hidden = self.mlp.act_fn(gate_hidden)
+            if self.use_virtual_gate:
+                gate_hidden = self.virtual_gate(gate_hidden)
+                up_hidden = self.virtual_gate(up_hidden)
+            hidden_states = self.mlp.down_proj(gate_hidden * up_hidden)
             return self.virtual_block_gate_2(hidden_states)
 
         if not self._warned_pretraining_tp_gated_mlp:
-            logging.warning("Using gated Llama MLP with pretraining_tp=%s", pretraining_tp)
+            logging.warning(
+                "Using gated Llama MLP with pretraining_tp=%s", pretraining_tp
+            )
             self._warned_pretraining_tp_gated_mlp = True
 
         if self.mlp.intermediate_size % pretraining_tp != 0:
@@ -85,13 +101,23 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         up_proj_slices = self.mlp.up_proj.weight.split(slice_size, dim=0)
         down_proj_slices = self.mlp.down_proj.weight.split(slice_size, dim=1)
 
-        gate_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in gate_proj_slices], dim=-1)
-        up_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in up_proj_slices], dim=-1)
+        gate_hidden = torch.cat(
+            [F.linear(mlp_inputs, weight) for weight in gate_proj_slices], dim=-1
+        )
+        up_hidden = torch.cat(
+            [F.linear(mlp_inputs, weight) for weight in up_proj_slices], dim=-1
+        )
+        gate_hidden = self.mlp.act_fn(gate_hidden)
 
-        intermediate_states = (
-            self.virtual_gate(self.mlp.act_fn(gate_hidden)) * self.virtual_gate(up_hidden)
-        ).split(slice_size, dim=2)
-        hidden_states = sum(F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(pretraining_tp))
+        if self.use_virtual_gate:
+            gate_hidden = self.virtual_gate(gate_hidden)
+            up_hidden = self.virtual_gate(up_hidden)
+
+        intermediate_states = (gate_hidden * up_hidden).split(slice_size, dim=2)
+        hidden_states = sum(
+            F.linear(intermediate_states[i], down_proj_slices[i])
+            for i in range(pretraining_tp)
+        )
         return self.virtual_block_gate_2(hidden_states)
 
     def forward(
@@ -128,7 +154,9 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         if self.attn_shortcut_Q is not None:
             shortcut_q = self.attn_shortcut_Q
             if self.use_gate:
-                shortcut_q = apply_shortcut_gate(shortcut_q, self.virtual_attn_gate_1, self.virtual_attn_gate_2)
+                shortcut_q = apply_shortcut_gate(
+                    shortcut_q, self.virtual_attn_gate_1, self.virtual_attn_gate_2
+                )
             rotated_residual = matmul(residual, shortcut_q)
             hidden_states = rotated_residual + hidden_states
         else:
@@ -146,7 +174,9 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
         if self.mlp_shortcut_Q is not None:
             shortcut_q = self.mlp_shortcut_Q
             if self.use_gate:
-                shortcut_q = apply_shortcut_gate(shortcut_q, self.virtual_block_gate_1, self.virtual_block_gate_2)
+                shortcut_q = apply_shortcut_gate(
+                    shortcut_q, self.virtual_block_gate_1, self.virtual_block_gate_2
+                )
             rotated_residual = matmul(residual, shortcut_q)
             hidden_states = rotated_residual + hidden_states
         else:
@@ -207,8 +237,12 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
     def compute_output_logits(self, input_ids: Tensor) -> FloatTensor:
         return self.model(input_ids=input_ids).logits
 
-    def convert_layer_to_compressed(self, layer: Module, layer_idx: int | None) -> Module:
-        compressed_layer = self.compressed_layer_type(self.config, layer_idx).to(self.config.torch_dtype)
+    def convert_layer_to_compressed(
+        self, layer: Module, layer_idx: int | None
+    ) -> Module:
+        compressed_layer = self.compressed_layer_type(self.config, layer_idx).to(
+            self.config.torch_dtype
+        )
         compressed_layer.load_state_dict(layer.state_dict(), strict=True)
         return compressed_layer
 
@@ -246,11 +280,17 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not (model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3")):
+        if not (
+            model_name.startswith("meta-llama/Llama-2")
+            or model_name.startswith("meta-llama/Meta-Llama-3")
+        ):
             return None
 
         model = LlamaForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
+            model_path,
+            torch_dtype=dtype,
+            token=token,
+            local_files_only=local_files_only,
         )
         model.config.torch_dtype = dtype
 
@@ -266,7 +306,10 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
         local_files_only: bool = False,
         token: str | bool | None = None,
     ) -> ModelAdapter | None:
-        if not (model_name.startswith("meta-llama/Llama-2") or model_name.startswith("meta-llama/Meta-Llama-3")):
+        if not (
+            model_name.startswith("meta-llama/Llama-2")
+            or model_name.startswith("meta-llama/Meta-Llama-3")
+        ):
             return None
 
         class UninitializedLlamaForCausalLM(LlamaForCausalLM):
@@ -274,7 +317,10 @@ class LlamaDispModelAdapter(LlamaModelAdapter):
                 pass
 
         config = LlamaConfig.from_pretrained(
-            model_path, torch_dtype=dtype, token=token, local_files_only=local_files_only
+            model_path,
+            torch_dtype=dtype,
+            token=token,
+            local_files_only=local_files_only,
         )
         model = UninitializedLlamaForCausalLM(config)
         model = model.to(dtype=dtype)

@@ -90,21 +90,19 @@ def bake_llama_hn_into_weights(model: torch.nn.Module, vectors: list[torch.Tenso
         attn_in = vectors[index]
         attn_out = vectors[index + 1]
         mlp_in = vectors[index + 2]
-        mlp_mid = vectors[index + 3]
-        mlp_out = vectors[index + 4]
+        mlp_out = vectors[index + 3]
 
         _zero_linear_input_columns(layer.self_attn.q_proj, attn_in)
         _zero_linear_input_columns(layer.self_attn.k_proj, attn_in)
         _zero_linear_input_columns(layer.self_attn.v_proj, attn_in)
         _zero_linear_output_rows(layer.self_attn.o_proj, attn_out)
 
-        _zero_linear_input_and_output(layer.mlp.gate_proj, mlp_in, mlp_mid)
-        _zero_linear_input_and_output(layer.mlp.up_proj, mlp_in, mlp_mid)
-        _zero_linear_input_columns(layer.mlp.down_proj, mlp_mid)
+        _zero_linear_input_columns(layer.mlp.gate_proj, mlp_in)
+        _zero_linear_input_columns(layer.mlp.up_proj, mlp_in)
         _zero_linear_output_rows(layer.mlp.down_proj, mlp_out)
 
         layer.use_gate = False
-        index += 5
+        index += 4
 
 
 def bake_phi2_hn_into_weights(model: torch.nn.Module, vectors: list[torch.Tensor]) -> None:

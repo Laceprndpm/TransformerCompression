@@ -155,9 +155,6 @@ def _set_gate_vectors_to_ones(compressed_layer: Module) -> None:
     compressed_layer.virtual_block_gate_1.set_vector_value(
         torch.ones_like(compressed_layer.virtual_block_gate_1.pruning_vector)
     )
-    compressed_layer.virtual_gate.set_vector_value(
-        torch.ones_like(compressed_layer.virtual_gate.pruning_vector)
-    )
     compressed_layer.virtual_block_gate_2.set_vector_value(
         torch.ones_like(compressed_layer.virtual_block_gate_2.pruning_vector)
     )
@@ -173,9 +170,6 @@ def _reference_tp_gated_mlp(layer: Module, hidden_states: Tensor) -> Tensor:
     gate_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in gate_proj_slices], dim=-1)
     up_hidden = torch.cat([F.linear(mlp_inputs, weight) for weight in up_proj_slices], dim=-1)
     gate_hidden = layer.mlp.act_fn(gate_hidden)
-    if layer.use_virtual_gate:
-        gate_hidden = layer.virtual_gate(gate_hidden)
-        up_hidden = layer.virtual_gate(up_hidden)
     intermediate_states = (gate_hidden * up_hidden).split(slice_size, dim=2)
     outputs = [
         F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(layer.config.pretraining_tp)
@@ -250,23 +244,6 @@ class TestLlamaDispAdapter(ModelAdapterTestBase):
         compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
         compressed_layer.use_gate = True
         _set_gate_vectors_to_ones(compressed_layer)
-
-        hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
-        normalized_hidden_states = compressed_layer.post_attention_layernorm(hidden_states)
-
-        actual = compressed_layer._apply_gated_mlp(normalized_hidden_states)
-        expected = _reference_tp_gated_mlp(compressed_layer, normalized_hidden_states)
-
-        torch.testing.assert_close(actual, expected)
-
-    def test_middle_virtual_gate_can_be_disabled_independently(self) -> None:
-        model_adapter = _make_llama_disp_adapter(pretraining_tp=2)
-        original_layer = model_adapter.get_layers()[0].layer
-        compressed_layer = model_adapter.convert_layer_to_compressed(original_layer, 0)
-        compressed_layer.use_gate = True
-        compressed_layer.use_virtual_gate = False
-        _set_gate_vectors_to_ones(compressed_layer)
-        compressed_layer.virtual_gate.set_vector_value(torch.zeros_like(compressed_layer.virtual_gate.pruning_vector))
 
         hidden_states = torch.randn(2, 4, model_adapter.config.hidden_size)
         normalized_hidden_states = compressed_layer.post_attention_layernorm(hidden_states)

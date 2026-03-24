@@ -179,12 +179,6 @@ def slicing_arg_parser() -> argparse.Namespace:
         help="Model kind for HN regularization/structure collection. Controls which collect_info_reg_* function is used.",
     )
     parser.add_argument(
-        "--use-virtual-gate",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable the middle virtual_gate where supported. Use --no-use-virtual-gate to disable it.",
-    )
-    parser.add_argument(
         "--attn-implementation",
         type=str,
         choices=["eager", "sdpa", "flash_attention_2"],
@@ -251,13 +245,6 @@ def slicing_main(args: argparse.Namespace) -> None:
     )
     model = model_adapter.model
 
-    def set_virtual_gate_status(target_model, enabled: bool) -> None:
-        for module in target_model.modules():
-            if hasattr(module, "use_virtual_gate"):
-                module.use_virtual_gate = enabled
-
-    set_virtual_gate_status(model, args.use_virtual_gate)
-
     def reset_model_device() -> None:
         if args.distribute_model:
             # distribute model across available GPUsDEFAULT_DTYPE
@@ -290,7 +277,6 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         hn_helper.set_gate_vectors(model, vectors)
         hn_helper.set_gate_status(model, use_gate=True)
-        set_virtual_gate_status(model, args.use_virtual_gate)
 
     dataset = data_utils.get_dataset(DEFAULT_CAL_DATASET)
     _, test_dataset = dataset["train"], dataset["test"]
@@ -405,7 +391,6 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         # Explicitly enable gate usage during HN training.
         hn_helper.set_gate_status(model_to_train, use_gate=True)
-        set_virtual_gate_status(model_to_train, args.use_virtual_gate)
 
         # Freeze model params; only train hn.
         for param in model_to_train.parameters():
@@ -496,7 +481,6 @@ def slicing_main(args: argparse.Namespace) -> None:
             hard_out = hn.hard_output()
         hn_helper.set_gate_vectors(model_to_train, hard_out)
         hn_helper.set_gate_status(model_to_train, use_gate=True)
-        set_virtual_gate_status(model_to_train, args.use_virtual_gate)
         eval_model = model_to_train
 
         # Save the hypernetwork checkpoint (match DISP behavior).

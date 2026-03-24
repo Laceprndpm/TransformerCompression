@@ -25,19 +25,13 @@ class collect_info_reg_llama(nn.Module):
         for layer_id in range(len(modules)):
             m = modules[layer_id]
             if type(m).__name__ == 'virtual_block_basic_operation':
-                self.structures.append(m.dim)
-                self.in_dim_list.append(None)
-                self.out_dim_list.append(None)
-                self.num_w_list.append(None)
-                self.gate_type.append('mlp_block')
-            if type(m).__name__ == 'virtual_mlp_operation':
-                ori_param = m.get_parameters()
+                ori_param = m.ex_dict['dim_1'] * m.ex_dict['dim_2'] * 2 + m.ex_dict['dim_1'] * m.ex_dict['dim_2']
                 self.sum_ori_params += ori_param
                 self.in_dim_list.append(m.ex_dict['dim_1'])
                 self.out_dim_list.append(m.ex_dict['dim_2'])
                 self.num_w_list.append(m.ex_dict['num_weight'])
                 self.structures.append(m.dim)
-                self.gate_type.append('mlp')
+                self.gate_type.append('mlp_block')
             if type(m).__name__ == 'virtual_block_attn_operation':
                 ori_param = m.get_parameters()
                 self.sum_ori_params += ori_param
@@ -48,12 +42,12 @@ class collect_info_reg_llama(nn.Module):
                 self.head_dim = m.head_dim
                 self.num_heads = m.dim
                 self.gate_type.append('attn_block')
-            # if type(m).__name__ == 'virtual_basic_operation':
-            #     self.structures.append(m.dim)
-            #     self.in_dim_list.append(None)
-            #     self.out_dim_list.append(None)
-            #     self.num_w_list.append(None)
-            #     self.gate_type.append('basic_gate')
+            if type(m).__name__ == 'virtual_basic_operation':
+                self.structures.append(m.dim)
+                self.in_dim_list.append(None)
+                self.out_dim_list.append(None)
+                self.num_w_list.append(None)
+                self.gate_type.append('basic_gate')
 
             print("Number of original parameters: %.3f" % (self.sum_ori_params / 10 ** 6))
             
@@ -73,10 +67,10 @@ class collect_info_reg_llama(nn.Module):
             # Process MLP blocks
             if self.gate_type[i] == 'mlp_block':
                 block_mlp_in_dim = vectors[i].sum()
-                block_mlp_middle_dim = vectors[i+1].sum()
-                block_mlp_out_dim = vectors[i+2].sum()
+                block_mlp_middle_dim = self.in_dim_list[i]
+                block_mlp_out_dim = vectors[i+1].sum()
                 current_params = block_mlp_in_dim * block_mlp_middle_dim * 2 + block_mlp_middle_dim * block_mlp_out_dim
-                i += 3
+                i += 2
                 sum_params += current_params
 
         # Calculate parameter ratio
@@ -106,20 +100,13 @@ class collect_info_reg_phi2(nn.Module):
 
         for name, m in model.named_modules():
             if type(m).__name__ == 'virtual_block_basic_operation':
-                self.structures.append(m.dim)
-                self.in_dim_list.append(None)
-                self.out_dim_list.append(None)
-                self.num_w_list.append(None)
-                self.gate_type.append('mlp_block')
-                self.gate_names.append(name)
-            if type(m).__name__ == 'virtual_mlp_operation':
-                ori_param = m.get_parameters()
+                ori_param = m.ex_dict['dim_1'] * m.ex_dict['dim_2'] * m.ex_dict['num_weight']
                 self.sum_ori_params += ori_param
+                self.structures.append(m.dim)
                 self.in_dim_list.append(m.ex_dict['dim_1'])
                 self.out_dim_list.append(m.ex_dict['dim_2'])
                 self.num_w_list.append(m.ex_dict['num_weight'])
-                self.structures.append(m.dim)
-                self.gate_type.append('mlp')
+                self.gate_type.append('mlp_block')
                 self.gate_names.append(name)
             if type(m).__name__ == 'virtual_block_attn_operation':
                 ori_param = m.get_parameters()
@@ -155,10 +142,10 @@ class collect_info_reg_phi2(nn.Module):
 
             if self.gate_type[i] == 'mlp_block':
                 block_mlp_in_dim = vectors[i].sum()
-                block_mlp_middle_dim = vectors[i + 1].sum()
-                block_mlp_out_dim = vectors[i + 2].sum()
+                block_mlp_middle_dim = self.in_dim_list[i]
+                block_mlp_out_dim = vectors[i + 1].sum()
                 current_params = block_mlp_in_dim * block_mlp_middle_dim + block_mlp_middle_dim * block_mlp_out_dim
-                i += 3
+                i += 2
                 sum_params += current_params
 
         return sum_params
@@ -201,9 +188,6 @@ class help_functions_hn(nn.Module):
                 if type(m).__name__ == 'virtual_att_operation':
                     m.set_vector_value(vectors[ind+1])
                     ind += 1
-                if type(m).__name__ == 'virtual_mlp_operation':
-                    m.set_vector_value(vectors[ind+1])
-                    ind += 1
         elif self.constrained == 'same':
             modules = list(model.modules())
             ind = 0
@@ -214,9 +198,6 @@ class help_functions_hn(nn.Module):
                     m.set_vector_value(model_dim)
                 if type(m).__name__ == 'virtual_block_basic_operation':
                     m.set_vector_value(model_dim)
-                if type(m).__name__ == 'virtual_mlp_operation':
-                    m.set_vector_value(vectors[ind+1])
-                    ind += 1
                 if type(m).__name__ == 'virtual_block_attn_operation':
                     m.set_vector_value(model_dim)
         else:
@@ -228,9 +209,6 @@ class help_functions_hn(nn.Module):
                     m.set_vector_value(vectors[ind])
                     ind += 1
                 if type(m).__name__ == 'virtual_block_basic_operation':
-                    m.set_vector_value(vectors[ind])
-                    ind += 1
-                if type(m).__name__ == 'virtual_mlp_operation':
                     m.set_vector_value(vectors[ind])
                     ind += 1
                 if type(m).__name__ == 'virtual_block_attn_operation':

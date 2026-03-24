@@ -16,7 +16,6 @@ from transformers.models.phi.modeling_phi import PhiConfig, PhiDecoderLayer, Phi
 from slicegpt.gates import (
     virtual_block_attn_operation,
     virtual_block_basic_operation,
-    virtual_mlp_operation,
     virtual_basic_operation,
 )
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
@@ -47,8 +46,7 @@ class CompressedPhiDecoderGateLayer(PhiDecoderLayer):
         self.virtual_attn_gate_1 = virtual_block_attn_operation(dim=config.hidden_size, ex_dict=ex_dict_attn)
         self.virtual_attn_gate_2 = virtual_basic_operation(dim=config.hidden_size)
 
-        self.virtual_block_gate_1 = virtual_block_basic_operation(dim=config.hidden_size)
-        self.virtual_gate = virtual_mlp_operation(dim=config.intermediate_size, ex_dict=ex_dict_mlp)
+        self.virtual_block_gate_1 = virtual_block_basic_operation(dim=config.hidden_size, ex_dict=ex_dict_mlp)
         self.virtual_block_gate_2 = virtual_basic_operation(dim=config.hidden_size)
 
     def forward(
@@ -85,7 +83,6 @@ class CompressedPhiDecoderGateLayer(PhiDecoderLayer):
         if self.use_gate:
             mlp_inputs = self.virtual_block_gate_1(mlp_inputs)
             mlp_hidden = self.mlp.fc1(mlp_inputs)
-            mlp_hidden = self.virtual_gate(mlp_hidden)
             mlp_hidden = self.mlp.activation_fn(mlp_hidden)
             mlp_outputs = self.mlp.fc2(mlp_hidden)
             mlp_outputs = self.virtual_block_gate_2(mlp_outputs)

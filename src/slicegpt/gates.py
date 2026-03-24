@@ -62,14 +62,6 @@ class virtual_block_attn_operation(virtual_basic_operation):
         return self.ex_dict["dim_1"] * self.ex_dict["dim_2"] * self.ex_dict["num_weight"]
 
 
-class virtual_mlp_operation(virtual_basic_operation):
-    def __init__(self, dim, ex_dict=None):
-        super().__init__(dim=dim, ex_dict=ex_dict)
-
-    def get_parameters(self):
-        return self.ex_dict["dim_1"] * self.ex_dict["dim_2"] * self.ex_dict["num_weight"]
-
-
 def apply_shortcut_gate(
     shortcut: torch.Tensor,
     input_gate: virtual_basic_operation,

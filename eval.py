@@ -71,10 +71,17 @@ def eval_arg_parser() -> argparse.Namespace:
         default=None,
         help="Path to a hypernetwork checkpoint. Only supported with --task ppl.",
     )
-    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16"], default="fp16")
+    parser.add_argument("--dtype", type=str, choices=["fp32", "fp16", "bf16"], default="fp16")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--hf-token", type=str, default=os.getenv("HF_TOKEN", None))
     parser.add_argument("--round-interval", type=int, default=8)
+    parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        choices=["eager", "sdpa", "flash_attention_2"],
+        default=None,
+        help="Optional Hugging Face attention implementation override for LLaMA models.",
+    )
 
     parser.add_argument(
         "--cal-dataset",
@@ -85,7 +92,6 @@ def eval_arg_parser() -> argparse.Namespace:
     )
     parser.add_argument("--ppl-eval-seqlen", type=int, default=None)
     parser.add_argument("--ppl-eval-batch-size", type=int, default=None)
-    parser.add_argument("--distribute-model", action="store_true")
 
     parser.add_argument("--lm-eval-tasks", type=str, default=None)
     parser.add_argument("--lm-eval-batch-size", type=int, default=None)
@@ -110,6 +116,8 @@ def process_eval_args(args: argparse.Namespace) -> None:
             raise argparse.ArgumentTypeError("--lm-eval-num-processes is only supported with --task lm_eval")
         if args.lm_eval_main_process_port is not None:
             raise argparse.ArgumentTypeError("--lm-eval-main-process-port is only supported with --task lm_eval")
+        if hasattr(args, "distribute_model") and args.distribute_model:
+            raise argparse.ArgumentTypeError("eval.py currently only supports single-device ppl evaluation")
 
         if args.cal_dataset is None:
             args.cal_dataset = "wikitext2"
@@ -126,8 +134,10 @@ def process_eval_args(args: argparse.Namespace) -> None:
             raise argparse.ArgumentTypeError("--ppl-eval-seqlen is only supported with --task ppl")
         if args.ppl_eval_batch_size is not None:
             raise argparse.ArgumentTypeError("--ppl-eval-batch-size is only supported with --task ppl")
-        if args.distribute_model:
-            raise argparse.ArgumentTypeError("--distribute-model is only supported with --task ppl")
+        if args.lm_eval_num_processes not in (None, 1):
+            raise argparse.ArgumentTypeError("eval.py currently only supports single-process lm_eval")
+        if args.lm_eval_main_process_port is not None:
+            raise argparse.ArgumentTypeError("eval.py single-process lm_eval does not use --lm-eval-main-process-port")
 
         if args.lm_eval_tasks is None:
             args.lm_eval_tasks = DEFAULT_LM_EVAL_TASKS
@@ -135,10 +145,7 @@ def process_eval_args(args: argparse.Namespace) -> None:
             args.lm_eval_batch_size = 16
         if args.lm_eval_dtype is None:
             args.lm_eval_dtype = "bfloat16"
-        if args.lm_eval_num_processes is None:
-            args.lm_eval_num_processes = 1
-        if args.lm_eval_main_process_port is None:
-            args.lm_eval_main_process_port = 12323
+        args.lm_eval_num_processes = 1
 
     if args.device:
         config.device = torch.device(args.device)
@@ -147,8 +154,22 @@ def process_eval_args(args: argparse.Namespace) -> None:
         config.dtype = torch.float16
     elif args.dtype == "fp32":
         config.dtype = torch.float32
+    elif args.dtype == "bf16":
+        config.dtype = torch.bfloat16
     else:
-        raise argparse.ArgumentTypeError("Data type should be one of 'fp16', 'fp32'")
+        raise argparse.ArgumentTypeError("Data type should be one of 'fp16', 'fp32', 'bf16'")
+
+
+def log_attention_backend(model: torch.nn.Module) -> None:
+    attn_impl = getattr(model.config, "_attn_implementation", None)
+    first_layer_attn = None
+    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
+        first_layer_attn = type(model.model.layers[0].self_attn).__name__
+    logging.info(
+        "Attention backend: config._attn_implementation=%s, first_layer.self_attn=%s",
+        attn_impl,
+        first_layer_attn,
+    )
 
 
 def build_param_reg(model, model_name: str):
@@ -215,16 +236,23 @@ def load_model_for_eval(args: argparse.Namespace):
             token=args.hf_token,
             sparsity=args.sparsity,
             round_interval=args.round_interval,
+            dtype=config.dtype,
+            attn_implementation=args.attn_implementation,
         )
-        return model_adapter.model, tokenizer, model_adapter
+        model = model_adapter.model
+        log_attention_backend(model)
+        return model, tokenizer, model_adapter
 
     model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(
         args.model,
         model_path=args.model_path,
         token=args.hf_token,
         dtype=config.dtype,
+        attn_implementation=args.attn_implementation,
     )
-    return model_adapter.model, tokenizer, model_adapter
+    model = model_adapter.model
+    log_attention_backend(model)
+    return model, tokenizer, model_adapter
 
 
 def get_pretrained_path(args: argparse.Namespace) -> str:
@@ -237,13 +265,7 @@ def run_ppl(args: argparse.Namespace) -> None:
     logging.info("Number of available cuda devices: %s", torch.cuda.device_count())
 
     model, tokenizer, model_adapter = load_model_for_eval(args)
-
-    if args.distribute_model:
-        if model_adapter is None:
-            raise ValueError("--distribute-model is not supported when loading a trust_remote_code export directory")
-        gpu_utils.distribute_model(model_adapter)
-    else:
-        model.to(config.device)
+    model.to(config.device)
 
     if args.hn_ckpt_path:
         if model_adapter is None:
@@ -263,17 +285,8 @@ def run_ppl(args: argparse.Namespace) -> None:
 
 def run_lm_eval(args: argparse.Namespace) -> None:
     pretrained_path = get_pretrained_path(args)
-    env = os.environ.copy()
-    env.setdefault("NCCL_P2P_DISABLE", "1")
-    env.setdefault("NCCL_IB_DISABLE", "1")
     command = [
         sys.executable,
-        "-m",
-        "accelerate.commands.launch",
-        "--main_process_port",
-        str(args.lm_eval_main_process_port),
-        "--num_processes",
-        str(args.lm_eval_num_processes),
         "-m",
         "lm_eval",
         "--model",
@@ -287,12 +300,7 @@ def run_lm_eval(args: argparse.Namespace) -> None:
     ]
 
     logging.info("Running lm_eval with command: %s", " ".join(command))
-    logging.info(
-        "lm_eval env overrides: NCCL_P2P_DISABLE=%s NCCL_IB_DISABLE=%s",
-        env["NCCL_P2P_DISABLE"],
-        env["NCCL_IB_DISABLE"],
-    )
-    subprocess.run(command, check=True, env=env)
+    subprocess.run(command, check=True)
 
 
 def eval_main(args: argparse.Namespace) -> None:

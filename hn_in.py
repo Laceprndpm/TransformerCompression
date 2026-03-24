@@ -216,6 +216,23 @@ def build_param_reg(model, args):
     return reg_builders[args.hn_model_kind](model, p=args.hn_p, lam=args.hn_lam)
 
 
+def log_attention_backend(model) -> None:
+    attn_impl = getattr(model.config, "_attn_implementation", None)
+    first_layer_attn = None
+    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
+        first_layer_attn = type(model.model.layers[0].self_attn).__name__
+    logging.info(
+        "Attention backend: config._attn_implementation=%s, first_layer.self_attn=%s",
+        attn_impl,
+        first_layer_attn,
+    )
+    if attn_impl == "flash_attention_2" and first_layer_attn is not None and "FlashAttention" not in first_layer_attn:
+        logging.warning(
+            "Requested flash_attention_2, but the instantiated attention class does not look like FlashAttention: %s",
+            first_layer_attn,
+        )
+
+
 def slicing_main(args: argparse.Namespace) -> None:
     logging.info("Running SliceGPT experiment.")
     logging.info(f"PyTorch device: {config.device}")
@@ -244,6 +261,7 @@ def slicing_main(args: argparse.Namespace) -> None:
         attn_implementation=args.attn_implementation,
     )
     model = model_adapter.model
+    log_attention_backend(model)
 
     def reset_model_device() -> None:
         if args.distribute_model:
@@ -328,7 +346,6 @@ def slicing_main(args: argparse.Namespace) -> None:
 
         # NOTE: keep model in train mode like DISP.
         model.config.use_cache = False
-        model.to(device_id)
 
         ignored_token = tokenizer.bos_token_id
         if ignored_token is None:
@@ -357,6 +374,11 @@ def slicing_main(args: argparse.Namespace) -> None:
         hn = hypernetwork(t_structures=param_reg.structures)
         hn_helper = help_functions_hn(param_reg.structures)
 
+        # Freeze model params before wrapping so FSDP does not prepare gradient
+        # bookkeeping for the base model; only the hypernetwork is trainable.
+        for param in model.parameters():
+            param.requires_grad = False
+
         hn.to(device_id)
         hn = DDP(hn)
 
@@ -367,34 +389,31 @@ def slicing_main(args: argparse.Namespace) -> None:
             my_auto_wrap_policy = partial(
                 transformer_auto_wrap_policy, transformer_layer_cls=wrap_cls
             )
-            if args.hn_use_bf16:
-                model.to(data_type)
-                model_fsdp = FSDP(
-                    model, auto_wrap_policy=my_auto_wrap_policy, use_orig_params=True
-                )
-            else:
-                model_fsdp = FSDP(
-                    model,
-                    auto_wrap_policy=my_auto_wrap_policy,
-                    use_orig_params=True,
-                    mixed_precision=MixedPrecision(
-                        param_dtype=data_type,
-                        reduce_dtype=data_type,
-                        buffer_dtype=data_type,
-                    ),
-                )
+            model_fsdp = FSDP(
+                model,
+                auto_wrap_policy=my_auto_wrap_policy,
+                use_orig_params=True,
+                device_id=torch.device("cuda", device_id),
+                mixed_precision=MixedPrecision(
+                    param_dtype=data_type,
+                    reduce_dtype=data_type,
+                    buffer_dtype=data_type,
+                ),
+            )
             model_to_train = model_fsdp
         else:
+            model.to(device_id)
             if args.hn_use_bf16:
                 model.to(data_type)
-            model_to_train = DDP(model)
+            # The base model is fully frozen; DDP would reject wrapping a module
+            # with no trainable parameters, and it is unnecessary here because only
+            # the hypernetwork is optimized and synchronized.
+            model_to_train = model
 
         # Explicitly enable gate usage during HN training.
         hn_helper.set_gate_status(model_to_train, use_gate=True)
 
-        # Freeze model params; only train hn.
-        for param in model_to_train.parameters():
-            param.requires_grad = False
+        # Only train hn.
         for param in hn.parameters():
             param.requires_grad = True
         hn.train()

@@ -25,7 +25,6 @@ from slicegpt.gates import (
     virtual_basic_operation,
     virtual_block_attn_operation,
     virtual_block_basic_operation,
-    virtual_mlp_operation,
 )
 from slicegpt.model_adapter import LayerAdapter, ModelAdapter
 
@@ -48,14 +47,7 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
             "head_dim": head_dim,
             "num_weight": 4,
         }
-        ex_dict_mlp = {
-            "dim_1": config.intermediate_size,
-            "dim_2": config.hidden_size,
-            "num_weight": 3,
-        }
-
         self.use_gate = False
-        self.use_virtual_gate = True
         self.virtual_attn_gate_1 = virtual_block_attn_operation(
             dim=config.hidden_size, ex_dict=ex_dict_attn
         )
@@ -63,9 +55,6 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
 
         self.virtual_block_gate_1 = virtual_block_basic_operation(
             dim=config.hidden_size
-        )
-        self.virtual_gate = virtual_mlp_operation(
-            dim=config.intermediate_size, ex_dict=ex_dict_mlp
         )
         self.virtual_block_gate_2 = virtual_basic_operation(dim=config.hidden_size)
         self._warned_pretraining_tp_gated_mlp = False
@@ -78,9 +67,6 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
             gate_hidden = self.mlp.gate_proj(mlp_inputs)
             up_hidden = self.mlp.up_proj(mlp_inputs)
             gate_hidden = self.mlp.act_fn(gate_hidden)
-            if self.use_virtual_gate:
-                gate_hidden = self.virtual_gate(gate_hidden)
-                up_hidden = self.virtual_gate(up_hidden)
             hidden_states = self.mlp.down_proj(gate_hidden * up_hidden)
             return self.virtual_block_gate_2(hidden_states)
 
@@ -108,10 +94,6 @@ class CompressedLlamaDecoderGateLayer(LlamaDecoderLayer):
             [F.linear(mlp_inputs, weight) for weight in up_proj_slices], dim=-1
         )
         gate_hidden = self.mlp.act_fn(gate_hidden)
-
-        if self.use_virtual_gate:
-            gate_hidden = self.virtual_gate(gate_hidden)
-            up_hidden = self.virtual_gate(up_hidden)
 
         intermediate_states = (gate_hidden * up_hidden).split(slice_size, dim=2)
         hidden_states = sum(

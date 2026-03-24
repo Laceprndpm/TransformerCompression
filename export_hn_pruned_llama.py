@@ -87,16 +87,12 @@ def build_layer_configs(model: torch.nn.Module, vectors: list[torch.Tensor]) -> 
             layer.mlp.gate_proj.in_features,
             f"layer {layer_idx} mlp input gate",
         )
-        mlp_mid = _mask_to_index(
-            vectors[vector_index + 3],
-            layer.mlp.gate_proj.out_features,
-            f"layer {layer_idx} mlp intermediate gate",
-        )
         mlp_out = _mask_to_index(
-            vectors[vector_index + 4],
+            vectors[vector_index + 3],
             layer.mlp.down_proj.out_features,
             f"layer {layer_idx} mlp output gate",
         )
+        mlp_mid = list(range(layer.mlp.gate_proj.out_features))
 
         layer_cfgs.append(
             {
@@ -111,7 +107,7 @@ def build_layer_configs(model: torch.nn.Module, vectors: list[torch.Tensor]) -> 
                 "mlp_copy_index": mlp_out,
             }
         )
-        vector_index += 5
+        vector_index += 4
 
     return layer_cfgs
 

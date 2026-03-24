@@ -48,12 +48,12 @@ class collect_info_reg_llama(nn.Module):
                 self.head_dim = m.head_dim
                 self.num_heads = m.dim
                 self.gate_type.append('attn_block')
-            if type(m).__name__ == 'virtual_basic_operation':
-                self.structures.append(m.dim)
-                self.in_dim_list.append(None)
-                self.out_dim_list.append(None)
-                self.num_w_list.append(None)
-                self.gate_type.append('basic_gate')
+            # if type(m).__name__ == 'virtual_basic_operation':
+            #     self.structures.append(m.dim)
+            #     self.in_dim_list.append(None)
+            #     self.out_dim_list.append(None)
+            #     self.num_w_list.append(None)
+            #     self.gate_type.append('basic_gate')
 
             print("Number of original parameters: %.3f" % (self.sum_ori_params / 10 ** 6))
             

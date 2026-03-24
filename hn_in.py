@@ -34,7 +34,6 @@ from src.disp.pruning.pruning_helper import (
     help_functions_hn,
 )
 
-DEFAULT_MODEL_DTYPE = torch.float32
 DEFAULT_CAL_DATASET = "wikitext2"
 DEFAULT_PPL_EVAL_BATCH_SIZE = 8
 DEFAULT_WANDB_PROJECT = "slicegpt"
@@ -42,8 +41,8 @@ FIXED_SPARSITY = 0.0
 FIXED_ROUND_INTERVAL = 1
 
 
-def get_disp_amp_dtype() -> torch.dtype:
-    """Match DISP: prefer bf16 when the current CUDA stack supports it, else fp16."""
+def get_runtime_dtype() -> torch.dtype:
+    """Use the common LLM runtime dtype: prefer bf16 when supported, else fp16."""
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float16
@@ -57,18 +56,11 @@ def slicing_arg_parser() -> argparse.Namespace:
         default="facebook/opt-125m",
         help="Model to load",
     )
-    path_group = parser.add_mutually_exclusive_group()
-    path_group.add_argument(
-        "--model-path",
-        type=str,
-        default=None,
-        help="Path to load the model and tokenizer from (required for local models, not required for HF models)",
-    )
-    path_group.add_argument(
+    parser.add_argument(
         "--sliced-model-path",
         type=str,
-        help="Path to load the model to fine-tune (sliced) and tokenizer from",
-        default=None,
+        required=True,
+        help="Path to load the PCA/step1 sliced model and tokenizer from.",
     )
     parser.add_argument(
         "--ppl-only",
@@ -210,10 +202,6 @@ def process_slicing_args(args):
     if args.device:
         config.device = torch.device(args.device)
 
-    # Match DISP more closely: load the base model in fp32, then control runtime precision
-    # with AMP/FSDP inside HN training.
-    config.dtype = DEFAULT_MODEL_DTYPE
-
     if args.train_hn and args.hn_model_kind is None:
         raise argparse.ArgumentTypeError(
             "When using --train-hn, you must also pass --hn-model-kind {llama,phi2}. Example: --hn-model-kind phi2"
@@ -251,25 +239,16 @@ def slicing_main(args: argparse.Namespace) -> None:
         # environment, e.g. notebook, IDE, no-shell process, etc. In this case, we want to continue without wandb.
         logging.info(f"Failed to initialize wandb: {e}, continuing without wandb")
         wandb.init(project=args.wandb_project, mode="disabled")
-    if args.sliced_model_path:
-        # load the model from sliced_model_path to compute perplexity and skip rotation and slicing
-        model_adapter, tokenizer = hf_utils.load_sliced_model(
-            args.model,
-            args.sliced_model_path,
-            sparsity=FIXED_SPARSITY,
-            round_interval=FIXED_ROUND_INTERVAL,
-            token=args.hf_token,
-            attn_implementation=args.attn_implementation,
-        )
-    else:
-        # load one of the pre-trained models
-        model_adapter, tokenizer = hf_utils.get_model_and_tokenizer(
-            args.model,
-            args.model_path,
-            token=args.hf_token,
-            dtype=config.dtype,
-            attn_implementation=args.attn_implementation,
-        )
+    load_dtype = get_runtime_dtype()
+    model_adapter, tokenizer = hf_utils.load_sliced_model(
+        args.model,
+        args.sliced_model_path,
+        sparsity=FIXED_SPARSITY,
+        round_interval=FIXED_ROUND_INTERVAL,
+        dtype=load_dtype,
+        token=args.hf_token,
+        attn_implementation=args.attn_implementation,
+    )
     model = model_adapter.model
 
     def set_virtual_gate_status(target_model, enabled: bool) -> None:
@@ -316,7 +295,9 @@ def slicing_main(args: argparse.Namespace) -> None:
     dataset = data_utils.get_dataset(DEFAULT_CAL_DATASET)
     _, test_dataset = dataset["train"], dataset["test"]
     test_loader = data_utils.prepare_test_dataloader(
-        dataset=test_dataset, tokenizer=tokenizer, batch_size=DEFAULT_PPL_EVAL_BATCH_SIZE
+        dataset=test_dataset,
+        tokenizer=tokenizer,
+        batch_size=DEFAULT_PPL_EVAL_BATCH_SIZE,
     )
 
     def train_hn() -> None:
@@ -333,8 +314,7 @@ def slicing_main(args: argparse.Namespace) -> None:
             timeout=datetime.timedelta(seconds=3600 * 5),
         )
 
-        # Follow DISP: AMP prefers bf16 when supported, otherwise fp16.
-        data_type = get_disp_amp_dtype()
+        data_type = get_runtime_dtype()
         if args.hn_use_bf16 and data_type != torch.bfloat16:
             logging.warning(
                 "--hn-use-bf16 was set, but bf16 is not supported on this CUDA setup; falling back to fp16."
@@ -540,8 +520,8 @@ def slicing_main(args: argparse.Namespace) -> None:
     if args.train_hn:
         train_hn()
 
-    # evaluate perplexity and exit if sliced model is loaded or if ppl_only is set
-    if args.sliced_model_path or args.ppl_only:
+    # evaluate perplexity and exit if requested, or after working with the sliced model
+    if args.ppl_only or args.sliced_model_path:
         if eval_model is None:
             reset_model_device()
         if hn_ckpt_path and eval_model is None:

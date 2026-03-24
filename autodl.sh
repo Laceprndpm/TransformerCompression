@@ -1,0 +1,15 @@
+torchrun --standalone --nproc_per_node=1 hn_in.py \
+        --model meta-llama/Llama-2-7b-hf \
+        --sliced-model-path models/step1/llama \
+        --device cuda \
+        --train-hn \
+        --hn-model-kind llama \
+        --hn-lam 4 \
+        --hn-p 0.7 \
+        --hn-steps 20000 \
+        --hn-use-bf16 \
+        --hn-block-size 2048 \
+        --hn-out-dir models/step2/llama \
+        --attn-implementation flash_attention_2 \
+        --no-use-virtual-gate \
+        --no-wandb
